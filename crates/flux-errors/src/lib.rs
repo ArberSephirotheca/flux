@@ -1,4 +1,4 @@
-#![feature(rustc_private, never_type)]
+#![feature(rustc_private)]
 
 extern crate rustc_data_structures;
 extern crate rustc_errors;
@@ -11,16 +11,12 @@ use flux_common::result::{ErrorCollector, ErrorEmitter};
 use rustc_data_structures::sync;
 pub use rustc_errors::ErrorGuaranteed;
 use rustc_errors::{
-    Diagnostic, ErrCode, FatalAbort, FatalError, LazyFallbackBundle,
+    Diagnostic, ErrCode, FatalError, TerminalUrl,
     annotate_snippet_emitter_writer::AnnotateSnippetEmitter,
-    emitter::{Emitter, HumanEmitter, HumanReadableErrorType, stderr_destination},
+    emitter::{Emitter, HumanReadableErrorType, OutputTheme, stderr_destination},
     json::JsonEmitter,
-    translation::Translator,
 };
-use rustc_session::{
-    config::{self, ErrorOutputType},
-    parse::ParseSess,
-};
+use rustc_session::{config, parse::ParseSess};
 use rustc_span::source_map::SourceMap;
 
 pub struct FluxSession {
@@ -31,12 +27,8 @@ pub struct FluxSession {
 pub const E0999: ErrCode = ErrCode::from_u32(999);
 
 impl FluxSession {
-    pub fn new(
-        opts: &config::Options,
-        source_map: Arc<SourceMap>,
-        fallback_bundle: LazyFallbackBundle,
-    ) -> Self {
-        let emitter = emitter(opts, source_map.clone(), fallback_bundle);
+    pub fn new(opts: &config::Options, source_map: Arc<SourceMap>) -> Self {
+        let emitter = emitter(opts, source_map.clone());
         let dcx = rustc_errors::DiagCtxt::new(emitter);
         Self { parse_sess: ParseSess::with_dcx(dcx, source_map) }
     }
@@ -51,7 +43,7 @@ impl FluxSession {
     }
 
     #[track_caller]
-    pub fn emit_fatal<'a>(&'a self, fatal: impl Diagnostic<'a, FatalAbort>) -> ! {
+    pub fn emit_fatal<'a>(&'a self, fatal: impl Diagnostic<'a>) -> ! {
         self.parse_sess.dcx().emit_fatal(fatal)
     }
 
@@ -69,49 +61,76 @@ impl FluxSession {
         self.abort_if_errors();
     }
 
-    pub fn dcx(&self) -> &rustc_errors::DiagCtxt {
-        &self.parse_sess.dcx()
+    pub fn dcx(&self) -> rustc_errors::DiagCtxtHandle<'_> {
+        self.parse_sess.dcx()
     }
 }
 
 fn emitter(
-    opts: &config::Options,
+    sopts: &config::Options,
     source_map: Arc<SourceMap>,
-    fallback_fluent_bundle: LazyFallbackBundle,
 ) -> Box<dyn Emitter + sync::DynSend> {
-    let track_diagnostics = opts.unstable_opts.track_diagnostics;
-
-    let translator = Translator { fluent_bundle: None, fallback_fluent_bundle };
-    match opts.error_format {
-        ErrorOutputType::HumanReadable { kind, color_config } => {
-            if let HumanReadableErrorType::AnnotateSnippet = kind {
-                let emitter =
-                    AnnotateSnippetEmitter::new(Some(source_map), translator, false, false);
-                Box::new(emitter)
-            } else {
-                let dst = stderr_destination(color_config);
-                let emitter = HumanEmitter::new(dst, translator)
-                    .sm(Some(source_map))
-                    .short_message(kind.short())
-                    .diagnostic_width(opts.diagnostic_width)
-                    .track_diagnostics(track_diagnostics)
-                    .terminal_url(opts.unstable_opts.terminal_urls);
-                Box::new(emitter)
+    // All the code below is copied from rustc_session::session::default_emitter
+    let macro_backtrace = sopts.unstable_opts.macro_backtrace;
+    let track_diagnostics = sopts.unstable_opts.track_diagnostics;
+    let terminal_url = match sopts.unstable_opts.terminal_urls {
+        TerminalUrl::Auto => {
+            match (std::env::var("COLORTERM").as_deref(), std::env::var("TERM").as_deref()) {
+                (Ok("truecolor"), Ok("xterm-256color"))
+                    if sopts.unstable_features.is_nightly_build() =>
+                {
+                    TerminalUrl::Yes
+                }
+                _ => TerminalUrl::No,
             }
         }
-        ErrorOutputType::Json { pretty, json_rendered, color_config } => {
+        t => t,
+    };
+
+    let source_map = if sopts.unstable_opts.link_only { None } else { Some(source_map) };
+
+    match sopts.error_format {
+        config::ErrorOutputType::HumanReadable { kind, color_config } => {
+            match kind {
+                HumanReadableErrorType { short, unicode } => {
+                    let emitter = AnnotateSnippetEmitter::new(stderr_destination(color_config))
+                        .sm(source_map)
+                        .short_message(short)
+                        .diagnostic_width(sopts.diagnostic_width)
+                        .macro_backtrace(macro_backtrace)
+                        .track_diagnostics(track_diagnostics)
+                        .terminal_url(terminal_url)
+                        .theme(if unicode { OutputTheme::Unicode } else { OutputTheme::Ascii })
+                        .ignored_directories_in_source_blocks(
+                            sopts
+                                .unstable_opts
+                                .ignore_directory_in_diagnostics_source_blocks
+                                .clone(),
+                        );
+                    Box::new(emitter.ui_testing(sopts.unstable_opts.ui_testing))
+                }
+            }
+        }
+        config::ErrorOutputType::Json { pretty, json_rendered, color_config } => {
             Box::new(
                 JsonEmitter::new(
                     Box::new(io::BufWriter::new(io::stderr())),
-                    Some(source_map),
-                    translator,
+                    source_map,
                     pretty,
                     json_rendered,
                     color_config,
                 )
+                .ui_testing(sopts.unstable_opts.ui_testing)
+                .ignored_directories_in_source_blocks(
+                    sopts
+                        .unstable_opts
+                        .ignore_directory_in_diagnostics_source_blocks
+                        .clone(),
+                )
+                .diagnostic_width(sopts.diagnostic_width)
+                .macro_backtrace(macro_backtrace)
                 .track_diagnostics(track_diagnostics)
-                .diagnostic_width(opts.diagnostic_width)
-                .terminal_url(opts.unstable_opts.terminal_urls),
+                .terminal_url(terminal_url),
             )
         }
     }

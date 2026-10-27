@@ -1,9 +1,9 @@
 // see issue 1097 -- testing the specs for `map` and `for_each`
 
-#![feature(step_trait, allocator_api)]
+#![feature(step_trait, allocator_ext)]
 #![allow(unused)]
 
-use flux_rs::attrs::*;
+use flux_attrs::*;
 
 #[path = "../lib/iterator.rs"]
 mod iterator;

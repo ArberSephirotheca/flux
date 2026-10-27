@@ -1,59 +1,91 @@
 #![feature(custom_test_frameworks)]
 #![test_runner(test_runner)]
 
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, str::FromStr};
 
 use compiletest_rs::{Config, common::Mode};
+use flux_dev::{Suite, default_flags};
+use flux_sysroot::SysrootManifest;
 use itertools::Itertools;
-use tests::{FLUX_SYSROOT, default_flags};
 
 #[derive(Debug)]
 struct Args {
     filters: Vec<String>,
-    flux: PathBuf,
+    flux_driver: PathBuf,
     sysroot: PathBuf,
+    /// Which subset of test suites to run.
+    suite: Suite,
+    /// Timeout in seconds for each fixpoint query.
+    fixpoint_timeout: Option<u64>,
 }
 
 impl Args {
     fn parse() -> Args {
         let mut filters = vec![];
         let mut sysroot = None;
-        let mut flux = None;
+        let mut flux_driver = None;
+        let mut suite = None;
+        let mut fixpoint_timeout = None;
         for (arg, val) in env::args().tuple_windows() {
             match &arg[..] {
-                "--filter" => {
-                    filters.push(val);
-                }
-                "--flux" => {
-                    if flux.is_some() {
-                        panic!("option '--flux' given more than once");
+                "--filter" => filters.push(val.clone()),
+                "--flux-driver" => {
+                    if flux_driver.is_some() {
+                        panic!("option '--flux-driver' given more than once");
                     }
-                    flux = Some(val);
+                    flux_driver = Some(val.clone());
                 }
                 "--sysroot" => {
                     if sysroot.is_some() {
                         panic!("option '--sysroot' given more than once");
                     }
-                    sysroot = Some(val);
+                    sysroot = Some(val.clone());
+                }
+                "--suite" => {
+                    if suite.is_some() {
+                        panic!("option '--suite' given more than once");
+                    }
+                    suite = Some(
+                        Suite::from_str(&val)
+                            .unwrap_or_else(|e| panic!("invalid --suite value `{val}`: {e}")),
+                    );
+                }
+                "--fixpoint-timeout" => {
+                    if fixpoint_timeout.is_some() {
+                        panic!("option '--fixpoint-timeout' given more than once");
+                    }
+                    fixpoint_timeout = Some(val.parse().unwrap_or_else(|e| {
+                        panic!("invalid --fixpoint-timeout value `{val}`: {e}")
+                    }));
                 }
                 _ => {}
             }
         }
-        let Some(flux) = flux else {
-            panic!("option '--flux' must be provided");
+        let Some(flux_driver) = flux_driver else {
+            panic!("option '--flux-driver' must be provided");
         };
         let Some(sysroot) = sysroot else {
             panic!("option '--sysroot' must be provided");
         };
-        Args { filters, flux: PathBuf::from(flux), sysroot: PathBuf::from(sysroot) }
+        let Some(suite) = suite else {
+            panic!("option '--suite' must be provided");
+        };
+        Args {
+            filters,
+            flux_driver: PathBuf::from(flux_driver),
+            sysroot: PathBuf::from(sysroot),
+            suite,
+            fixpoint_timeout,
+        }
     }
 }
 
 fn test_runner(_: &[&()]) {
     let args = Args::parse();
-    let mut config = Config { rustc_path: args.flux, filters: args.filters, ..Config::default() };
+    let mut config =
+        Config { rustc_path: args.flux_driver, filters: args.filters, ..Config::default() };
 
-    let mut flags = default_flags();
+    let mut flags = default_flags(&args.sysroot, SysrootManifest::extern_args(&args.sysroot));
 
     // Pass `--emit=metadata` and `-Ffull-compilation=on` to make sure we emit `.fluxmeta` and
     // other artifacts for tests using `@aux-build`.
@@ -62,26 +94,24 @@ fn test_runner(_: &[&()]) {
     // Pass `-Fsummary=off` to disable printing the summary at the end of each test
     flags.extend(["-Fsummary=off".to_string()]);
 
+    if let Some(timeout) = args.fixpoint_timeout {
+        flags.push(format!("-Ffixpoint-timeout={timeout}"));
+    }
+
     config.target_rustcflags = Some(flags.join(" "));
 
     config.clean_rmeta();
     config.clean_rlib();
     config.strict_headers = true;
 
-    // SAFETY: this is safe because this part of the code is single threaded
-    unsafe {
-        // Set the sysroot dir so the `flux` binary can find the correct `flux-driver.
-        env::set_var(FLUX_SYSROOT, args.sysroot);
-    }
-
-    let path: PathBuf = ["tests", "pos"].iter().collect();
+    let path = args.suite.pos_tests();
     if path.exists() {
         config.mode = Mode::Ui;
         config.src_base = path;
         compiletest_rs::run_tests(&config);
     }
 
-    let path: PathBuf = ["tests", "neg"].iter().collect();
+    let path = args.suite.neg_tests();
     if path.exists() {
         config.mode = Mode::CompileFail;
         config.src_base = path;

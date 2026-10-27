@@ -25,10 +25,17 @@ pub const FLUX_ATTRS: &[&str] = &[
     "opts",
     "reft",
     "no_panic",
+    "assume_parametric",
+    "no_suggestions",
 ];
 
 pub fn extern_spec(attr: TokenStream, tokens: TokenStream) -> TokenStream {
     extern_spec::transform_extern_spec(attr, tokens).unwrap_or_else(|err| err.to_compile_error())
+}
+
+pub fn extern_spec_doc(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    extern_spec::transform_extern_spec_doc(attr, tokens)
+        .unwrap_or_else(|err| err.to_compile_error())
 }
 
 pub fn flux_tool_item_attr(name: &str, attr: TokenStream, item: TokenStream) -> TokenStream {

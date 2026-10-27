@@ -1,6 +1,7 @@
-#![feature(rustc_private, box_patterns, new_range_api)]
+#![feature(deref_patterns, rustc_private)]
 
 extern crate rustc_ast;
+extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_span;
 
@@ -98,6 +99,15 @@ impl ParseSess {
 
     pub fn parse_expr(&mut self, tokens: &TokenStream, span: Span) -> ParseResult<surface::Expr> {
         parser::parse_expr(&mut self.cx(tokens, span), true)
+    }
+
+    pub fn parse_static_info(
+        &mut self,
+        tokens: &TokenStream,
+        span: Span,
+    ) -> ParseResult<surface::StaticInfo> {
+        let ty = parser::parse_type(&mut self.cx(tokens, span))?;
+        Ok(surface::StaticInfo { ty })
     }
 
     pub fn parse_constant_info(

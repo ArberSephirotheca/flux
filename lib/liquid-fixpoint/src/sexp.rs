@@ -4,7 +4,7 @@ use std::str::Chars;
 pub enum Atom {
     S(String),
     Q(String),
-    I(u128),
+    I(i128),
     F(f64),
     B(bool),
 }
@@ -50,6 +50,7 @@ impl<'a> Parser<'a> {
         match self.current {
             Some('(') => self.parse_list(),
             Some('"') => self.parse_quoted_string(),
+            Some('@') => self.parse_at_var(),
             Some(_) => self.parse_atom(),
             None => Err(ParseError::UnexpectedEOF),
         }
@@ -74,6 +75,25 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Sexp::List(items))
+    }
+
+    fn parse_at_var(&mut self) -> Result<Sexp, ParseError> {
+        let mut result = String::new();
+        while let Some(c) = self.current {
+            match c {
+                ')' => {
+                    result.push(c);
+                    self.bump();
+                    return Ok(Sexp::Atom(Atom::S(result)));
+                }
+                _ => {
+                    result.push(c);
+                    self.bump();
+                }
+            }
+        }
+
+        Err(ParseError::UnclosedString)
     }
 
     fn parse_quoted_string(&mut self) -> Result<Sexp, ParseError> {
@@ -121,7 +141,7 @@ impl<'a> Parser<'a> {
             "true" => Ok(Sexp::Atom(Atom::B(true))),
             "false" => Ok(Sexp::Atom(Atom::B(false))),
             _ => {
-                if let Ok(i) = s.parse::<u128>() {
+                if let Ok(i) = s.parse::<i128>() {
                     Ok(Sexp::Atom(Atom::I(i)))
                 } else if let Ok(f) = s.parse::<f64>() {
                     Ok(Sexp::Atom(Atom::F(f)))

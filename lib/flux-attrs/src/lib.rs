@@ -35,6 +35,11 @@ pub fn reveal(attr: TokenStream, tokens: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
+pub fn hide(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::hide(attr, tokens)
+}
+
+#[proc_macro_attribute]
 pub fn refined_by(attr: TokenStream, tokens: TokenStream) -> TokenStream {
     attr_impl::refined_by(attr, tokens)
 }
@@ -72,6 +77,11 @@ pub fn trusted(attr: TokenStream, tokens: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn trusted_impl(attr: TokenStream, tokens: TokenStream) -> TokenStream {
     attr_impl::trusted_impl(attr, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn trusted_derive(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::trusted_derive(attr, tokens)
 }
 
 #[proc_macro_attribute]
@@ -120,8 +130,23 @@ pub fn no_panic(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
+pub fn no_panic_if(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::no_panic_if(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn no_suggestions(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::no_suggestions(attrs, tokens)
+}
+
+#[proc_macro_attribute]
 pub fn reft(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
     attr_impl::reft(attrs, tokens)
+}
+
+#[proc_macro_attribute]
+pub fn assume_parametric(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::assume_parametric(attrs, tokens)
 }
 
 #[cfg(flux_sysroot)]
@@ -157,6 +182,7 @@ mod attr_sysroot {
         sig,
         qualifiers,
         reveal,
+        hide,
         constant,
         invariant,
         opaque,
@@ -164,6 +190,7 @@ mod attr_sysroot {
         opts,
         trusted,
         trusted_impl,
+        trusted_derive,
         proven_externally,
         generics,
         assoc,
@@ -171,6 +198,9 @@ mod attr_sysroot {
         should_fail,
         reft,
         no_panic,
+        no_panic_if,
+        assume_parametric,
+        no_suggestions,
     );
 }
 
@@ -186,8 +216,8 @@ mod attr_dummy {
         TokenStream::new()
     }
 
-    pub fn extern_spec(_attrs: TokenStream, _tokens: TokenStream) -> TokenStream {
-        TokenStream::new()
+    pub fn extern_spec(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+        flux_attrs_impl::extern_spec_doc(attrs.into(), tokens.into()).into()
     }
 
     macro_rules! no_op {
@@ -207,6 +237,7 @@ mod attr_dummy {
         sig,
         qualifiers,
         reveal,
+        hide,
         invariant,
         constant,
         opaque,
@@ -214,12 +245,16 @@ mod attr_dummy {
         opts,
         trusted,
         trusted_impl,
+        trusted_derive,
         proven_externally,
         generics,
         assoc,
         ignore,
         should_fail,
         no_panic,
+        no_panic_if,
+        no_suggestions,
         reft,
+        assume_parametric,
     );
 }

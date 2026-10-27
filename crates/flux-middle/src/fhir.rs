@@ -15,51 +15,65 @@
 
 pub mod visit;
 
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, iter};
 
 use flux_common::{bug, span_bug};
 use flux_config::PartialInferOpts;
-use flux_rustc_bridge::def_id_to_string;
 pub use flux_syntax::surface::{BinOp, UnOp};
-use flux_syntax::surface::{Ignored, ParamMode, Trusted};
+use flux_syntax::{
+    surface::{self, Ignored, Trusted},
+    symbols::sym,
+};
 use itertools::Itertools;
 use rustc_abi;
 pub use rustc_abi::VariantIdx;
 use rustc_ast::TraitObjectSyntax;
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
-use rustc_hash::FxHashMap;
+use rustc_data_structures::{
+    fx::{FxIndexMap, FxIndexSet},
+    unord::UnordMap,
+};
 pub use rustc_hir::PrimTy;
 use rustc_hir::{
     FnHeader, OwnerId, ParamName, Safety,
-    def::{DefKind, Namespace},
+    def::DefKind,
     def_id::{DefId, LocalDefId},
 };
 use rustc_index::newtype_index;
 use rustc_macros::{Decodable, Encodable};
 pub use rustc_middle::mir::Mutability;
-use rustc_middle::{middle::resolve_bound_vars::ResolvedArg, ty::TyCtxt};
+use rustc_middle::ty::TyCtxt;
 use rustc_span::{ErrorGuaranteed, Span, Symbol, symbol::Ident};
 
 use crate::{
     def_id::{FluxDefId, FluxLocalDefId, MaybeExternId},
+    global_env::GlobalEnv,
     rty::QualifierKind,
 };
 
 pub enum Attr {
     Trusted(Trusted),
     TrustedImpl(Trusted),
+    TrustedDerive(Trusted),
     Ignore(Ignored),
     ProvenExternally(Span),
     ShouldFail,
     InferOpts(PartialInferOpts),
     NoPanic,
+    NoSuggestions,
 }
 
 #[derive(Clone, Copy, Default)]
 pub struct AttrMap<'fhir> {
     pub attrs: &'fhir [Attr],
     pub qualifiers: &'fhir [FluxLocalDefId],
-    pub reveals: &'fhir [FluxDefId],
+    /// The definitions listed in `#[reveal(...)]` together with the span where they are named.
+    pub reveals: &'fhir [(FluxDefId, Span)],
+    /// The definitions listed in `#[hide(...)]` together with the span where they are named.
+    pub hides: &'fhir [(FluxDefId, Span)],
+    /// The `DefId`s of type params listed in `#[assume_parametric(...)]`. They match
+    /// the `DefId` entries in `generics_of(callee_id)`. These are `DefId`s and not
+    /// `LocalDefId`s such that they are correct for extern specs as well.
+    pub parametric_params: &'fhir [DefId],
 }
 
 impl AttrMap<'_> {
@@ -87,6 +101,12 @@ impl AttrMap<'_> {
         })
     }
 
+    pub(crate) fn trusted_derive(&self) -> Option<Trusted> {
+        self.attrs.iter().find_map(|attr| {
+            if let Attr::TrustedDerive(trusted) = *attr { Some(trusted) } else { None }
+        })
+    }
+
     pub(crate) fn should_fail(&self) -> bool {
         self.attrs
             .iter()
@@ -101,6 +121,16 @@ impl AttrMap<'_> {
 
     pub(crate) fn no_panic(&self) -> bool {
         self.attrs.iter().any(|attr| matches!(attr, Attr::NoPanic))
+    }
+
+    pub(crate) fn parametric_params(&self) -> &[DefId] {
+        self.parametric_params
+    }
+
+    pub(crate) fn no_suggestions(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|attr| matches!(attr, Attr::NoSuggestions))
     }
 }
 
@@ -122,13 +152,14 @@ pub struct GenericParam<'fhir> {
 pub enum GenericParamKind<'fhir> {
     Type { default: Option<Ty<'fhir>> },
     Lifetime,
-    Const { ty: Ty<'fhir> },
+    Const { ty: Ty<'fhir>, has_default: bool },
 }
 
 #[derive(Debug)]
 pub struct Qualifier<'fhir> {
     pub def_id: FluxLocalDefId,
     pub args: &'fhir [RefineParam<'fhir>],
+    pub wildcards: &'fhir [bool],
     pub expr: Expr<'fhir>,
     pub kind: QualifierKind,
 }
@@ -189,7 +220,9 @@ impl<'fhir> OwnerNode<'fhir> {
             OwnerNode::ImplItem(impl_item) => &impl_item.generics,
             OwnerNode::ForeignItem(foreign_item) => {
                 match foreign_item.kind {
-                    ForeignItemKind::Fn(_, generics) => generics,
+                    ForeignItemKind::Fn(.., generics) | ForeignItemKind::Static(.., generics) => {
+                        generics
+                    }
                 }
             }
         }
@@ -251,6 +284,7 @@ pub enum ItemKind<'fhir> {
     Impl(Impl<'fhir>),
     Fn(FnSig<'fhir>),
     Const(Option<Expr<'fhir>>),
+    Static(Option<Ty<'fhir>>),
 }
 
 #[derive(Debug)]
@@ -286,6 +320,7 @@ pub enum FluxItem<'fhir> {
     Qualifier(&'fhir Qualifier<'fhir>),
     Func(&'fhir SpecFunc<'fhir>),
     PrimOpProp(&'fhir PrimOpProp<'fhir>),
+    Axiom(&'fhir Axiom<'fhir>),
     SortDecl(&'fhir SortDecl),
 }
 
@@ -295,6 +330,7 @@ impl FluxItem<'_> {
             FluxItem::Qualifier(qualifier) => qualifier.def_id,
             FluxItem::Func(func) => func.def_id,
             FluxItem::PrimOpProp(prop) => prop.def_id,
+            FluxItem::Axiom(axiom) => axiom.def_id,
             FluxItem::SortDecl(sort_decl) => sort_decl.def_id,
         }
     }
@@ -311,6 +347,7 @@ pub struct ForeignItem<'fhir> {
 #[derive(Debug)]
 pub enum ForeignItemKind<'fhir> {
     Fn(FnSig<'fhir>, &'fhir Generics<'fhir>),
+    Static(Ty<'fhir>, Mutability, Safety, &'fhir Generics<'fhir>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,7 +357,7 @@ pub struct SortDecl {
     pub span: Span,
 }
 
-pub type SortDecls = FxHashMap<Symbol, SortDecl>;
+pub type SortDecls = UnordMap<Symbol, SortDecl>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WhereBoundPredicate<'fhir> {
@@ -334,7 +371,7 @@ pub type GenericBounds<'fhir> = &'fhir [GenericBound<'fhir>];
 #[derive(Debug, Clone, Copy)]
 pub enum GenericBound<'fhir> {
     Trait(PolyTraitRef<'fhir>),
-    Outlives(Lifetime),
+    Outlives,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -512,6 +549,7 @@ pub struct Requires<'fhir> {
 pub struct FnSig<'fhir> {
     pub header: FnHeader,
     pub decl: &'fhir FnDecl<'fhir>,
+    pub no_panic_if: Option<Expr<'fhir>>,
 }
 
 #[derive(Clone, Copy)]
@@ -551,20 +589,21 @@ pub enum TyKind<'fhir> {
     /// Constrained types `{T | p}` are like existentials but without binders, and are useful
     /// for specifying constraints on indexed values e.g. `{i32[@a] | 0 <= a}`
     Constr(Expr<'fhir>, &'fhir Ty<'fhir>),
-    StrgRef(Lifetime, &'fhir PathExpr<'fhir>, &'fhir Ty<'fhir>),
-    Ref(Lifetime, MutTy<'fhir>),
+    StrgRef(&'fhir PathExpr<'fhir>, &'fhir Ty<'fhir>),
+    Ref(&'fhir Ty<'fhir>, Mutability),
     BareFn(&'fhir BareFnTy<'fhir>),
     Tuple(&'fhir [Ty<'fhir>]),
     Array(&'fhir Ty<'fhir>, ConstArg),
-    RawPtr(&'fhir Ty<'fhir>, Mutability),
     OpaqueDef(&'fhir OpaqueTy<'fhir>),
-    TraitObject(&'fhir [PolyTraitRef<'fhir>], Lifetime, TraitObjectSyntax),
+    TraitObject(&'fhir [PolyTraitRef<'fhir>], TraitObjectSyntax),
     Never,
     Infer,
     Err(ErrorGuaranteed),
 }
 
 pub struct BareFnTy<'fhir> {
+    /// Refinement params bound by the fn pointer type, e.g., `n` in `fn(i32[@n]) -> i32[n]`
+    pub params: &'fhir [RefineParam<'fhir>],
     pub safety: Safety,
     pub abi: rustc_abi::ExternAbi,
     pub generic_params: &'fhir [GenericParam<'fhir>],
@@ -572,35 +611,23 @@ pub struct BareFnTy<'fhir> {
     pub param_idents: &'fhir [Option<Ident>],
 }
 
-#[derive(Clone, Copy)]
-pub struct MutTy<'fhir> {
-    pub ty: &'fhir Ty<'fhir>,
-    pub mutbl: Mutability,
-}
-
-/// Our surface syntax doesn't have lifetimes. To deal with them we create a *hole* for every lifetime
-/// which we then resolve when we check for structural compatibility against the rust type.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Lifetime {
-    /// A lifetime hole created during desugaring.
-    Hole(FhirId),
-    /// A resolved lifetime created during lifting.
-    Resolved(ResolvedArg),
-}
-
 /// Owner version of [`FluxLocalDefId`]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Encodable, Decodable)]
 pub enum FluxOwnerId {
     Flux(FluxLocalDefId),
-    Rust(OwnerId),
+    Rust(MaybeExternId<OwnerId>),
 }
 
 impl FluxOwnerId {
-    pub fn def_id(self) -> Option<LocalDefId> {
+    pub fn as_rust(self) -> Option<MaybeExternId<OwnerId>> {
         match self {
             FluxOwnerId::Flux(_) => None,
-            FluxOwnerId::Rust(owner_id) => Some(owner_id.def_id),
+            FluxOwnerId::Rust(owner_id) => Some(owner_id),
         }
+    }
+
+    pub fn resolved_id(self) -> Option<DefId> {
+        self.as_rust().map(MaybeExternId::resolved_id)
     }
 }
 
@@ -649,6 +676,7 @@ impl<'fhir> BaseTy<'fhir> {
 pub enum BaseTyKind<'fhir> {
     Path(QPath<'fhir>),
     Slice(&'fhir Ty<'fhir>),
+    RawPtr(&'fhir Ty<'fhir>, Mutability),
     Err(ErrorGuaranteed),
 }
 
@@ -694,7 +722,6 @@ pub enum AssocItemConstraintKind<'fhir> {
 
 #[derive(Clone, Copy)]
 pub enum GenericArg<'fhir> {
-    Lifetime(Lifetime),
     Type(&'fhir Ty<'fhir>),
     Const(ConstArg),
     Infer,
@@ -719,12 +746,95 @@ pub enum ConstArgKind {
     Infer,
 }
 
+/// Different kinds of symbols can coexist even if they share the same textual name.
+/// Therefore, they each have a separate universe (known as a "namespace").
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum Namespace {
+    /// We also put sorts in this namespace.
+    ///
+    /// See [`rustc_hir::def::Namespace::TypeNS`]
+    TypeNS,
+    /// See [`rustc_hir::def::Namespace::ValueNS`]
+    ValueNS,
+    /// See [`rustc_hir::def::Namespace::MacroNS`]
+    MacroNS,
+    /// The refinement namespace includes refinement functions, theory function,
+    /// refinement parameters, ...
+    ReftNS,
+}
+
+impl Namespace {
+    /// A human-readable description, used in diagnostics.
+    pub fn descr(self) -> &'static str {
+        match self {
+            Namespace::TypeNS => "type",
+            Namespace::ValueNS => "value",
+            Namespace::MacroNS => "macro",
+            Namespace::ReftNS => "value",
+        }
+    }
+
+    /// The corresponding [`rustc_hir::def::Namespace`], or `None` for the flux-only namespaces.
+    pub fn to_rustc(self) -> Option<rustc_hir::def::Namespace> {
+        match self {
+            Namespace::TypeNS => Some(rustc_hir::def::Namespace::TypeNS),
+            Namespace::ValueNS => Some(rustc_hir::def::Namespace::ValueNS),
+            Namespace::MacroNS => Some(rustc_hir::def::Namespace::MacroNS),
+            Namespace::ReftNS => None,
+        }
+    }
+}
+
+impl From<rustc_hir::def::Namespace> for Namespace {
+    fn from(ns: rustc_hir::def::Namespace) -> Self {
+        match ns {
+            rustc_hir::def::Namespace::TypeNS => Namespace::TypeNS,
+            rustc_hir::def::Namespace::ValueNS => Namespace::ValueNS,
+            rustc_hir::def::Namespace::MacroNS => Namespace::MacroNS,
+        }
+    }
+}
+
+/// Flux's analogue of [`rustc_hir::def::PerNS`], carrying one `T` per [`Namespace`] (including the
+/// flux-specific ones), indexable by [`Namespace`].
+#[derive(Debug, Clone)]
+pub struct PerNS<T> {
+    pub type_ns: T,
+    pub value_ns: T,
+    pub macro_ns: T,
+    pub flux_fn_ns: T,
+}
+
+impl<T> std::ops::Index<Namespace> for PerNS<T> {
+    type Output = T;
+
+    fn index(&self, ns: Namespace) -> &T {
+        match ns {
+            Namespace::TypeNS => &self.type_ns,
+            Namespace::ValueNS => &self.value_ns,
+            Namespace::MacroNS => &self.macro_ns,
+            Namespace::ReftNS => &self.flux_fn_ns,
+        }
+    }
+}
+
+impl<T> std::ops::IndexMut<Namespace> for PerNS<T> {
+    fn index_mut(&mut self, ns: Namespace) -> &mut T {
+        match ns {
+            Namespace::TypeNS => &mut self.type_ns,
+            Namespace::ValueNS => &mut self.value_ns,
+            Namespace::MacroNS => &mut self.macro_ns,
+            Namespace::ReftNS => &mut self.flux_fn_ns,
+        }
+    }
+}
+
 /// The resolution of a path
 ///
 /// The enum contains a subset of the variants in [`rustc_hir::def::Res`] plus some extra variants
 /// for stuff refinements resolve to.
-#[derive(Eq, PartialEq, Debug, Copy, Clone)]
-pub enum Res<Id = !> {
+#[derive(Eq, PartialEq, Debug, Copy, Clone, Encodable, Decodable)]
+pub enum Res<Id = ParamId> {
     /// See [`rustc_hir::def::Res::Def`]
     Def(DefKind, DefId),
     /// See [`rustc_hir::def::Res::PrimTy`]
@@ -742,12 +852,25 @@ pub enum Res<Id = !> {
     Param(ParamKind, Id),
     /// A refinement function defined with `flux::defs! { ... }`
     GlobalFunc(SpecFuncKind),
+    /// A primitive sort, e.g., `int`, `bool`, `Set`, `Map`.
+    PrimSort(PrimSort),
+    /// A sort parameter inside a polymorphic function or data sort.
+    SortParam(usize),
+    /// A user declared sort.
+    UserSort(FluxDefId),
     Err,
+}
+
+/// Akin to `rustc_middle::middle::resolve::ModChild` but for flux items defined in a module
+#[derive(Debug, Clone, Copy, Encodable, Decodable)]
+pub struct FluxModChild {
+    pub ident: Ident,
+    pub res: Res<!>,
 }
 
 /// See [`rustc_hir::def::PartialRes`]
 #[derive(Copy, Clone, Debug)]
-pub struct PartialRes<Id = !> {
+pub struct PartialRes<Id = ParamId> {
     base_res: Res<Id>,
     unresolved_segments: usize,
 }
@@ -802,8 +925,23 @@ pub struct RefineParam<'fhir> {
     pub fhir_id: FhirId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encodable, Decodable)]
+pub enum ParamMode {
+    Horn,
+    Hindley,
+}
+
+impl From<surface::ParamMode> for ParamMode {
+    fn from(value: surface::ParamMode) -> Self {
+        match value {
+            surface::ParamMode::Horn => Self::Horn,
+            surface::ParamMode::Hindley => Self::Hindley,
+        }
+    }
+}
+
 /// How a parameter was declared in the surface syntax.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Encodable, Decodable)]
 pub enum ParamKind {
     /// A parameter declared in an explicit scope, e.g., `fn foo[hdl n: int](x: i32[n])`
     Explicit(Option<ParamMode>),
@@ -864,71 +1002,71 @@ impl InferMode {
     }
 }
 
-#[derive(Clone, Copy)]
+/// `bool`, `char`, and `str` are primitive sorts, but because sorts and types are in the same
+/// namespace we resolve them to [`Res::PrimTy`] and then make them into a sort during `conv`
+/// they share their name with the
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Encodable, Decodable)]
 pub enum PrimSort {
     Int,
-    Bool,
-    Char,
     Real,
     Set,
     Map,
+    RawPtr,
+    Bool,
+    Char,
     Str,
 }
 
 impl PrimSort {
+    pub const ALL: [Self; 8] = [
+        Self::Int,
+        Self::Real,
+        Self::Set,
+        Self::Map,
+        Self::RawPtr,
+        Self::Bool,
+        Self::Char,
+        Self::Str,
+    ];
+
+    pub fn name(self) -> Symbol {
+        match self {
+            PrimSort::Int => sym::int,
+            PrimSort::Real => sym::real,
+            PrimSort::Set => sym::Set,
+            PrimSort::Map => sym::Map,
+            PrimSort::RawPtr => sym::ptr,
+            PrimSort::Bool => sym::bool,
+            PrimSort::Char => sym::char,
+            PrimSort::Str => sym::str,
+        }
+    }
     pub fn name_str(self) -> &'static str {
         match self {
             PrimSort::Int => "int",
-            PrimSort::Str => "str",
-            PrimSort::Bool => "bool",
-            PrimSort::Char => "char",
             PrimSort::Real => "real",
             PrimSort::Set => "Set",
             PrimSort::Map => "Map",
+            PrimSort::RawPtr => "ptr",
+            PrimSort::Bool => "bool",
+            PrimSort::Char => "char",
+            PrimSort::Str => "str",
         }
     }
 
     /// Number of generics expected by this primitive sort
     pub fn generics(self) -> usize {
         match self {
-            PrimSort::Int | PrimSort::Bool | PrimSort::Real | PrimSort::Char | PrimSort::Str => 0,
+            PrimSort::Bool
+            | PrimSort::Char
+            | PrimSort::Str
+            | PrimSort::Int
+            | PrimSort::Real
+            | PrimSort::RawPtr => 0,
             PrimSort::Set => 1,
             PrimSort::Map => 2,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub enum SortRes {
-    /// A primitive sort.
-    PrimSort(PrimSort),
-    /// A user declared sort.
-    User(FluxDefId),
-    /// A sort parameter inside a polymorphic function or data sort.
-    SortParam(usize),
-    /// The sort associated to a (generic) type parameter
-    TyParam(DefId),
-    /// The sort of the `Self` type, as used within a trait.
-    SelfParam {
-        /// The trait this `Self` is a generic parameter for.
-        trait_id: DefId,
-    },
-    /// The sort of a `Self` type, as used somewhere other than within a trait.
-    SelfAlias {
-        /// The item introducing the `Self` type alias, e.g., an impl block.
-        alias_to: DefId,
-    },
-    /// The sort of an associated type in a trait declaration, e.g:
-    ///
-    /// ```ignore
-    /// #[assoc(fn assoc_reft(x: Self::Assoc) -> bool)]
-    /// trait MyTrait {
-    ///     type Assoc;
-    /// }
-    /// ```
-    SelfParamAssoc { trait_id: DefId, ident: Ident },
-    /// The sort automatically generated for an adt (enum/struct) with a `flux::refined_by` annotation
-    Adt(DefId),
 }
 
 #[derive(Clone, Copy)]
@@ -943,6 +1081,8 @@ pub enum Sort<'fhir> {
     /// The sort associated with a base type. This is normalized into a concrete sort during
     /// conversion
     SortOf(BaseTy<'fhir>),
+    /// A tuple sort, e.g., (int, bool)
+    Tuple(&'fhir [Sort<'fhir>]),
     /// A sort that needs to be inferred.
     Infer,
     Err(ErrorGuaranteed),
@@ -951,7 +1091,7 @@ pub enum Sort<'fhir> {
 /// See [`flux_syntax::surface::SortPath`]
 #[derive(Clone, Copy)]
 pub struct SortPath<'fhir> {
-    pub res: SortRes,
+    pub res: PartialRes,
     pub segments: &'fhir [Ident],
     pub args: &'fhir [Sort<'fhir>],
 }
@@ -1014,10 +1154,10 @@ pub enum QuantKind {
     Exists,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Encodable, Decodable)]
-pub struct Range {
-    pub start: usize,
-    pub end: usize,
+#[derive(Clone, Copy)]
+pub enum QuantDom {
+    Bounded { start: usize, end: usize },
+    Unbounded,
 }
 
 #[derive(Clone, Copy)]
@@ -1033,11 +1173,12 @@ pub enum ExprKind<'fhir> {
     Alias(AliasReft<'fhir>, &'fhir [Expr<'fhir>]),
     IfThenElse(&'fhir Expr<'fhir>, &'fhir Expr<'fhir>, &'fhir Expr<'fhir>),
     Abs(&'fhir [RefineParam<'fhir>], &'fhir Expr<'fhir>),
-    BoundedQuant(QuantKind, RefineParam<'fhir>, Range, &'fhir Expr<'fhir>),
+    Quant(QuantKind, RefineParam<'fhir>, QuantDom, &'fhir Expr<'fhir>),
     Record(&'fhir [Expr<'fhir>]),
     SetLiteral(&'fhir [Expr<'fhir>]),
     Constructor(Option<PathExpr<'fhir>>, &'fhir [FieldExpr<'fhir>], Option<&'fhir Spread<'fhir>>),
     Block(&'fhir [LetDecl<'fhir>], &'fhir Expr<'fhir>),
+    Tuple(&'fhir [Expr<'fhir>]),
     Err(ErrorGuaranteed),
 }
 
@@ -1054,14 +1195,9 @@ pub struct LetDecl<'fhir> {
 }
 
 #[derive(Clone, Copy)]
-pub enum NumLitKind {
-    Int,
-    Real,
-}
-
-#[derive(Clone, Copy)]
 pub enum Lit {
-    Int(u128, Option<NumLitKind>),
+    Int(u128),
+    Real(Symbol),
     Bool(bool),
     Str(Symbol),
     Char(char),
@@ -1070,7 +1206,7 @@ pub enum Lit {
 #[derive(Clone, Copy)]
 pub struct PathExpr<'fhir> {
     pub segments: &'fhir [Ident],
-    pub res: Res<ParamId>,
+    pub res: Res,
     pub fhir_id: FhirId,
     pub span: Span,
 }
@@ -1083,6 +1219,7 @@ impl<'fhir> PathExpr<'fhir> {
 
 newtype_index! {
     #[debug_format = "a{}"]
+    #[encodable]
     pub struct ParamId {}
 }
 
@@ -1097,8 +1234,8 @@ impl PolyTraitRef<'_> {
     }
 }
 
-impl From<OwnerId> for FluxOwnerId {
-    fn from(owner_id: OwnerId) -> Self {
+impl From<MaybeExternId<OwnerId>> for FluxOwnerId {
+    fn from(owner_id: MaybeExternId<OwnerId>) -> Self {
         FluxOwnerId::Rust(owner_id)
     }
 }
@@ -1120,13 +1257,16 @@ impl<Id> Res<Id> {
             Res::SelfTyAlias { .. } | Res::SelfTyParam { .. } => "self type",
             Res::Param(..) => "refinement parameter",
             Res::GlobalFunc(..) => "refinement function",
+            Res::PrimSort(..) => "primitive sort",
+            Res::SortParam(..) => "sort parameter",
+            Res::UserSort(..) => "user-defined sort",
             Res::Err => "unresolved item",
         }
     }
 
     pub fn is_box(&self, tcx: TyCtxt) -> bool {
         if let Res::Def(DefKind::Struct, def_id) = self {
-            tcx.adt_def(def_id).is_box()
+            tcx.adt_def(*def_id).is_box()
         } else {
             false
         }
@@ -1135,11 +1275,14 @@ impl<Id> Res<Id> {
     /// Returns `None` if this is `Res::Err`
     pub fn ns(&self) -> Option<Namespace> {
         match self {
-            Res::Def(kind, ..) => kind.ns(),
+            Res::Def(kind, ..) => kind.ns().map(Namespace::from),
             Res::PrimTy(..) | Res::SelfTyAlias { .. } | Res::SelfTyParam { .. } => {
                 Some(Namespace::TypeNS)
             }
-            Res::Param(..) | Res::GlobalFunc(..) => Some(Namespace::ValueNS),
+            Res::Param(..) | Res::GlobalFunc(..) => Some(Namespace::ReftNS),
+            // Sorts share the type namespace: primitive sorts live in the type prelude and
+            // sort parameters in the type ribs, so they resolve through `TypeNS` alongside types.
+            Res::PrimSort(..) | Res::SortParam(..) | Res::UserSort(..) => Some(Namespace::TypeNS),
             Res::Err => None,
         }
     }
@@ -1159,6 +1302,9 @@ impl<Id> Res<Id> {
             }
             Res::SelfTyParam { trait_ } => Res::SelfTyParam { trait_ },
             Res::GlobalFunc(spec_func_kind) => Res::GlobalFunc(spec_func_kind),
+            Res::PrimSort(prim_sort) => Res::PrimSort(prim_sort),
+            Res::SortParam(n) => Res::SortParam(n),
+            Res::UserSort(def_id) => Res::UserSort(def_id),
             Res::Err => Res::Err,
         }
     }
@@ -1175,7 +1321,7 @@ impl<Id1, Id2> TryFrom<rustc_hir::def::Res<Id1>> for Res<Id2> {
         match res {
             rustc_hir::def::Res::Def(kind, did) => Ok(Res::Def(kind, did)),
             rustc_hir::def::Res::PrimTy(prim_ty) => Ok(Res::PrimTy(prim_ty)),
-            rustc_hir::def::Res::SelfTyAlias { alias_to, forbid_generic: false, is_trait_impl } => {
+            rustc_hir::def::Res::SelfTyAlias { alias_to, is_trait_impl } => {
                 Ok(Res::SelfTyAlias { alias_to, is_trait_impl })
             }
             rustc_hir::def::Res::SelfTyParam { trait_ } => Ok(Res::SelfTyParam { trait_ }),
@@ -1239,7 +1385,16 @@ pub struct PrimOpProp<'fhir> {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A (global) axiom: `body` is assumed to hold for all values of `args`.
+#[derive(Debug)]
+pub struct Axiom<'fhir> {
+    pub def_id: FluxLocalDefId,
+    pub args: &'fhir [RefineParam<'fhir>],
+    pub body: Expr<'fhir>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encodable, Decodable)]
 pub enum SpecFuncKind {
     /// Theory symbols *interpreted* by the SMT solver
     Thy(liquid_fixpoint::ThyFunc),
@@ -1264,6 +1419,11 @@ impl<'fhir> Generics<'fhir> {
             .iter()
             .find(|p| p.def_id.local_id() == def_id)
             .unwrap()
+    }
+
+    pub fn empty(genv: GlobalEnv<'fhir, '_>) -> Self {
+        let params = genv.alloc_slice_fill_iter(iter::empty());
+        Self { params, refinement_params: &[], predicates: None }
     }
 }
 
@@ -1390,9 +1550,9 @@ impl fmt::Debug for Ty<'_> {
                     write!(f, ". {ty:?}}}")
                 }
             }
-            TyKind::StrgRef(_lft, loc, ty) => write!(f, "&strg <{loc:?}: {ty:?}>"),
-            TyKind::Ref(_lft, mut_ty) => {
-                write!(f, "&{}{:?}", mut_ty.mutbl.prefix_str(), mut_ty.ty)
+            TyKind::StrgRef(loc, ty) => write!(f, "&strg <{loc:?}: {ty:?}>"),
+            TyKind::Ref(ty, mutbl) => {
+                write!(f, "&{}{:?}", mutbl.prefix_str(), ty)
             }
             TyKind::BareFn(bare_fn_ty) => {
                 write!(f, "{bare_fn_ty:?}")
@@ -1401,13 +1561,11 @@ impl fmt::Debug for Ty<'_> {
             TyKind::Array(ty, len) => write!(f, "[{ty:?}; {len:?}]"),
             TyKind::Never => write!(f, "!"),
             TyKind::Constr(pred, ty) => write!(f, "{{{ty:?} | {pred:?}}}"),
-            TyKind::RawPtr(ty, Mutability::Not) => write!(f, "*const {ty:?}"),
-            TyKind::RawPtr(ty, Mutability::Mut) => write!(f, "*mut {ty:?}"),
             TyKind::Infer => write!(f, "_"),
             TyKind::OpaqueDef(opaque_ty) => {
                 write!(f, "impl trait <def_id = {:?}>", opaque_ty.def_id.resolved_id(),)
             }
-            TyKind::TraitObject(poly_traits, _lft, _syntax) => {
+            TyKind::TraitObject(poly_traits, _syntax) => {
                 write!(f, "dyn {poly_traits:?}")
             }
             TyKind::Err(_) => write!(f, "err"),
@@ -1428,15 +1586,6 @@ impl fmt::Debug for BareFnTy<'_> {
             )?;
         }
         write!(f, "{:?}", self.decl)
-    }
-}
-
-impl fmt::Debug for Lifetime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Lifetime::Hole(_) => write!(f, "'_"),
-            Lifetime::Resolved(lft) => write!(f, "{lft:?}"),
-        }
     }
 }
 
@@ -1461,6 +1610,8 @@ impl fmt::Debug for BaseTy<'_> {
         match &self.kind {
             BaseTyKind::Path(qpath) => write!(f, "{qpath:?}"),
             BaseTyKind::Slice(ty) => write!(f, "[{ty:?}]"),
+            BaseTyKind::RawPtr(ty, Mutability::Not) => write!(f, "*const {ty:?}"),
+            BaseTyKind::RawPtr(ty, Mutability::Mut) => write!(f, "*mut {ty:?}"),
             BaseTyKind::Err(_) => write!(f, "err"),
         }
     }
@@ -1505,7 +1656,6 @@ impl fmt::Debug for GenericArg<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             GenericArg::Type(ty) => write!(f, "{ty:?}"),
-            GenericArg::Lifetime(lft) => write!(f, "{lft:?}"),
             GenericArg::Const(cst) => write!(f, "{cst:?}"),
             GenericArg::Infer => write!(f, "_"),
         }
@@ -1540,6 +1690,15 @@ impl fmt::Debug for QuantKind {
         match self {
             QuantKind::Forall => write!(f, "∀"),
             QuantKind::Exists => write!(f, "∃"),
+        }
+    }
+}
+
+impl fmt::Debug for QuantDom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuantDom::Bounded { start, end } => write!(f, "in {start:?} .. {end:?}"),
+            QuantDom::Unbounded => Ok(()),
         }
     }
 }
@@ -1591,8 +1750,8 @@ impl fmt::Debug for Expr<'_> {
                     write!(f, "{{ {:?} }}", exprs.iter().format(", "))
                 }
             }
-            ExprKind::BoundedQuant(kind, refine_param, rng, expr) => {
-                write!(f, "{kind:?} {refine_param:?} in {}.. {} {{ {expr:?} }}", rng.start, rng.end)
+            ExprKind::Quant(kind, refine_param, dom, expr) => {
+                write!(f, "{kind:?} {refine_param:?} {dom:?} {{ {expr:?} }}")
             }
             ExprKind::Err(_) => write!(f, "err"),
             ExprKind::Block(decls, body) => {
@@ -1600,6 +1759,9 @@ impl fmt::Debug for Expr<'_> {
                     write!(f, "let {:?} = {:?};", decl.param, decl.init)?;
                 }
                 write!(f, "{body:?}")
+            }
+            ExprKind::Tuple(exprs) => {
+                write!(f, "({:?})", exprs.iter().format(", "))
             }
         }
     }
@@ -1614,8 +1776,8 @@ impl fmt::Debug for PathExpr<'_> {
 impl fmt::Debug for Lit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Lit::Int(i, Some(NumLitKind::Real)) => write!(f, "{i}real"),
-            Lit::Int(i, _) => write!(f, "{i}"),
+            Lit::Int(i) => write!(f, "{i}"),
+            Lit::Real(s) => write!(f, "{s}"),
             Lit::Bool(b) => write!(f, "{b}"),
             Lit::Str(s) => write!(f, "\"{s:?}\""),
             Lit::Char(c) => write!(f, "\'{c}\'"),
@@ -1631,6 +1793,7 @@ impl fmt::Debug for Sort<'_> {
             Sort::Loc => write!(f, "loc"),
             Sort::Func(fsort) => write!(f, "{fsort:?}"),
             Sort::SortOf(bty) => write!(f, "<{bty:?}>::sort"),
+            Sort::Tuple(sorts) => write!(f, "({:?})", sorts.iter().format(", ")),
             Sort::Infer => write!(f, "_"),
             Sort::Err(_) => write!(f, "err"),
         }
@@ -1644,33 +1807,6 @@ impl fmt::Debug for SortPath<'_> {
             write!(f, "<{:?}>", self.args.iter().format(", "))?;
         }
         Ok(())
-    }
-}
-
-impl fmt::Debug for SortRes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SortRes::PrimSort(PrimSort::Bool) => write!(f, "bool"),
-            SortRes::PrimSort(PrimSort::Int) => write!(f, "int"),
-            SortRes::PrimSort(PrimSort::Real) => write!(f, "real"),
-            SortRes::PrimSort(PrimSort::Char) => write!(f, "char"),
-            SortRes::PrimSort(PrimSort::Str) => write!(f, "str"),
-            SortRes::PrimSort(PrimSort::Set) => write!(f, "Set"),
-            SortRes::PrimSort(PrimSort::Map) => write!(f, "Map"),
-            SortRes::SortParam(n) => write!(f, "@{n}"),
-            SortRes::TyParam(def_id) => write!(f, "{}::sort", def_id_to_string(*def_id)),
-            SortRes::SelfParam { trait_id } => {
-                write!(f, "{}::Self::sort", def_id_to_string(*trait_id))
-            }
-            SortRes::SelfAlias { alias_to } => {
-                write!(f, "{}::Self::sort", def_id_to_string(*alias_to))
-            }
-            SortRes::SelfParamAssoc { ident: assoc, .. } => {
-                write!(f, "Self::{assoc}")
-            }
-            SortRes::User(def_id) => write!(f, "{:?}", def_id.name()),
-            SortRes::Adt(def_id) => write!(f, "{}::sort", def_id_to_string(*def_id)),
-        }
     }
 }
 

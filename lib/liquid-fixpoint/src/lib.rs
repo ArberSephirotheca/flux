@@ -4,6 +4,12 @@
 #![cfg_attr(feature = "nightly", feature(rustc_private))]
 
 #[cfg(feature = "nightly")]
+extern crate rustc_data_structures;
+// Link rustc-private dependencies through the driver dylib in unit tests.
+#[cfg(all(test, feature = "nightly"))]
+#[allow(unused_extern_crates)]
+extern crate rustc_driver;
+#[cfg(feature = "nightly")]
 extern crate rustc_macros;
 #[cfg(feature = "nightly")]
 extern crate rustc_serialize;
@@ -19,10 +25,13 @@ mod constraint_with_env;
 #[cfg(feature = "rust-fixpoint")]
 mod cstr2smt2;
 mod format;
-#[cfg(feature = "rust-fixpoint")]
 mod graph;
 pub mod parser;
 pub mod sexp;
+mod smt_fmt;
+pub mod smt_horn;
+mod suggestion_solver;
+mod z3_subprocess;
 
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
@@ -30,6 +39,7 @@ use std::{
     hash::{Hash, Hasher},
     io,
     str::FromStr,
+    time::Duration,
 };
 #[cfg(not(feature = "rust-fixpoint"))]
 use std::{
@@ -38,8 +48,9 @@ use std::{
 };
 
 pub use constraint::{
-    BinOp, BinRel, Bind, BoundVar, Constant, Constraint, DataCtor, DataDecl, DataField, Expr,
-    FunSort, Pred, Qualifier, Sort, SortCtor, SortDecl,
+    Axiom, BinOp, BinRel, Bind, Constant, Constraint, DataCtor, DataDecl, DataField, Expr,
+    FlatConstraint, FunSort, Pred, QualParam, Qualifier, Quantifier, Sort, SortCtor, SortDecl,
+    WKVar,
 };
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
@@ -49,14 +60,19 @@ use serde::{Deserialize, Serialize, de};
 /// Type alias for qualifier assignments used in constraint solving
 pub type Assignments<'a, T> = HashMap<<T as Types>::KVar, Vec<(&'a Qualifier<T>, Vec<usize>)>>;
 
+#[cfg(not(feature = "rust-fixpoint"))]
+use process_control::{ChildExt, Control};
+
 #[cfg(feature = "rust-fixpoint")]
 use crate::constraint_with_env::ConstraintWithEnv;
+pub use crate::suggestion_solver::{SuggestionSolver, SuggestionSolverError};
 
 pub trait Types {
     type Sort: Identifier + Hash + Clone + Debug + Eq;
     type KVar: Identifier + Hash + Clone + Debug + Eq;
     type Var: Identifier + Hash + Clone + Debug + Eq;
-    type String: FixpointFmt + Hash + Clone + Debug;
+    type String: FixpointFmt + Hash + Clone + Debug + Eq;
+    type Real: FixpointFmt + Hash + Clone + Debug + Eq;
     type Tag: fmt::Display + FromStr + Hash + Clone + Debug;
 }
 
@@ -114,13 +130,14 @@ macro_rules! declare_types {
         type KVar = $kvar:ty;
         type Var = $var:ty;
         type String = $str:ty;
+        type Real = $real:ty;
         type Tag = $tag:ty;
     ) => {
         pub mod fixpoint_generated {
             pub struct FixpointTypes;
             pub type Expr = $crate::Expr<FixpointTypes>;
-            pub type Pred = $crate::Pred<FixpointTypes>;
             pub type Constraint = $crate::Constraint<FixpointTypes>;
+            pub type FlatConstraint = $crate::FlatConstraint<FixpointTypes>;
             pub type KVarDecl = $crate::KVarDecl<FixpointTypes>;
             pub type ConstDecl = $crate::ConstDecl<FixpointTypes>;
             pub type FunDef = $crate::FunDef<FixpointTypes>;
@@ -128,6 +145,8 @@ macro_rules! declare_types {
             pub type FunBody = $crate::FunBody<FixpointTypes>;
             pub type Task = $crate::Task<FixpointTypes>;
             pub type Qualifier = $crate::Qualifier<FixpointTypes>;
+            pub type Axiom = $crate::Axiom<FixpointTypes>;
+            pub type QualParam = $crate::QualParam<FixpointTypes>;
             pub type Sort = $crate::Sort<FixpointTypes>;
             pub type SortCtor = $crate::SortCtor<FixpointTypes>;
             pub type SortDecl = $crate::SortDecl<FixpointTypes>;
@@ -136,7 +155,8 @@ macro_rules! declare_types {
             pub type DataField = $crate::DataField<FixpointTypes>;
             pub type Bind = $crate::Bind<FixpointTypes>;
             pub type Constant = $crate::Constant<FixpointTypes>;
-            pub use $crate::{BinOp, BinRel, BoundVar, ThyFunc};
+            pub type Pred = $crate::Pred<FixpointTypes>;
+            pub use $crate::{BinOp, BinRel, Quantifier, ThyFunc, WKVar};
         }
 
         impl $crate::Types for fixpoint_generated::FixpointTypes {
@@ -144,9 +164,25 @@ macro_rules! declare_types {
             type KVar = $kvar;
             type Var = $var;
             type String = $str;
+            type Real = $real;
             type Tag = $tag;
         }
     };
+}
+
+pub fn qe_and_simplify<T: Types>(
+    solver: &mut SuggestionSolver<T>,
+    constraint: &FlatConstraint<T>,
+    binder_consts: &[ConstDecl<T>],
+) -> Result<Expr<T>, SuggestionSolverError> {
+    solver.qe_and_simplify(constraint, binder_consts)
+}
+
+pub fn check_validity<T: Types>(
+    solver: &mut SuggestionSolver<T>,
+    constraint: &FlatConstraint<T>,
+) -> Result<bool, SuggestionSolverError> {
+    solver.check_validity(constraint)
 }
 
 #[derive_where(Hash, Clone, Debug)]
@@ -157,7 +193,7 @@ pub struct ConstDecl<T: Types> {
     pub comment: Option<String>,
 }
 
-#[derive_where(Hash, Debug)]
+#[derive_where(Hash, Clone, Debug)]
 pub struct FunDef<T: Types> {
     pub name: T::Var,
     pub sort: FunSort<T>,
@@ -166,7 +202,7 @@ pub struct FunDef<T: Types> {
     pub comment: Option<String>,
 }
 
-#[derive_where(Hash, Debug)]
+#[derive_where(Hash, Clone, Debug)]
 pub struct FunBody<T: Types> {
     pub args: Vec<T::Var>,
     pub expr: Expr<T>,
@@ -182,6 +218,7 @@ pub struct Task<T: Types> {
     pub kvars: Vec<KVarDecl<T>>,
     pub constraint: Constraint<T>,
     pub qualifiers: Vec<Qualifier<T>>,
+    pub axioms: Vec<Axiom<T>>,
     pub scrape_quals: bool,
     pub solver: SmtSolver,
 }
@@ -213,13 +250,38 @@ pub enum FixpointStatus<Tag> {
     Crash(CrashInfo),
 }
 
+/// An error that prevented fixpoint from producing a result
+#[derive(Debug)]
+pub enum FixpointError {
+    /// Fixpoint didn't finish within the given timeout and was killed
+    Timeout,
+    Io(io::Error),
+}
+
+impl From<io::Error> for FixpointError {
+    fn from(err: io::Error) -> Self {
+        FixpointError::Io(err)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(tag = "tag", content = "contents")]
+pub enum LeanStatus {
+    #[default]
+    Invalid,
+    /// The proof was checked when the user-written lean files had the given digest.
+    Valid(u64),
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(bound(deserialize = "Tag: FromStr", serialize = "Tag: ToString"))]
-pub struct FixpointResult<Tag> {
+pub struct VerificationResult<Tag> {
     pub status: FixpointStatus<Tag>,
     pub solution: Vec<KVarBind>,
     #[serde(rename = "nonCutsSolution")]
     pub non_cuts_solution: Vec<KVarBind>,
+    #[serde(default)]
+    pub lean_status: LeanStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -301,8 +363,10 @@ impl CrashInfo {
 pub struct KVarDecl<T: Types> {
     pub kvid: T::KVar,
     pub sorts: Vec<Sort<T>>,
-    #[derive_where(skip)]
-    pub comment: String,
+    /// Number of leading arguments in `sorts` that are self arguments. Fixpoint only instantiates
+    /// qualifiers whose self parameters are bound to self arguments, so a kvar with no self
+    /// arguments can only be solved to `true` or `false`.
+    pub self_args: usize,
 }
 
 impl<T: Types> Task<T> {
@@ -312,8 +376,12 @@ impl<T: Types> Task<T> {
         hasher.finish()
     }
 
+    /// Runs the task. The timeout is ignored by the rust implementation.
     #[cfg(feature = "rust-fixpoint")]
-    pub fn run(&self) -> io::Result<FixpointResult<T::Tag>> {
+    pub fn run(
+        &self,
+        _timeout: Option<Duration>,
+    ) -> Result<VerificationResult<T::Tag>, FixpointError> {
         let mut cstr_with_env = ConstraintWithEnv::new(
             self.data_decls.clone(),
             self.kvars.clone(),
@@ -321,18 +389,25 @@ impl<T: Types> Task<T> {
             self.constants.clone(),
             self.constraint.clone(),
         );
-        Ok(FixpointResult {
+        Ok(VerificationResult {
             status: cstr_with_env.is_satisfiable(),
             solution: vec![],
             non_cuts_solution: vec![],
+            lean_status: LeanStatus::default(),
         })
     }
 
+    /// Runs the task by calling the fixpoint binary. If `timeout` is given and fixpoint doesn't
+    /// finish in time, the process is killed and [`FixpointError::Timeout`] is returned.
     #[cfg(not(feature = "rust-fixpoint"))]
-    pub fn run(&self) -> io::Result<FixpointResult<T::Tag>> {
+    pub fn run(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<VerificationResult<T::Tag>, FixpointError> {
         let mut child = Command::new("fixpoint")
             .arg("-q")
             .arg("--stdin")
+            .arg("--sorted-solution")
             .arg("--json")
             .arg("--allowho")
             .arg("--allowhoqs")
@@ -345,9 +420,15 @@ impl<T: Types> Task<T> {
         std::mem::swap(&mut stdin, &mut child.stdin);
         {
             let mut w = BufWriter::new(stdin.unwrap());
-            writeln!(w, "{self}")?;
+            // Use compact formatting to reduce overhead when communicating with fixpoint
+            writeln!(w, "{}", format::CompactTask(self))?;
         }
-        let out = child.wait_with_output()?;
+
+        let mut control = child.controlled_with_output();
+        if let Some(timeout) = timeout {
+            control = control.time_limit(timeout).terminate_for_timeout();
+        }
+        let out = control.wait()?.ok_or(FixpointError::Timeout)?;
 
         serde_json::from_slice(&out.stdout).map_err(|err| {
             // If we fail to parse stdout fixpoint may have outputed something to stderr
@@ -355,17 +436,17 @@ impl<T: Types> Task<T> {
             if !out.stderr.is_empty() {
                 let stderr = std::str::from_utf8(&out.stderr)
                     .unwrap_or("fixpoint exited with a non-zero return code");
-                io::Error::other(stderr)
+                FixpointError::Io(io::Error::other(stderr))
             } else {
-                err.into()
+                FixpointError::Io(err.into())
             }
         })
     }
 }
 
 impl<T: Types> KVarDecl<T> {
-    pub fn new(kvid: T::KVar, sorts: Vec<Sort<T>>, comment: String) -> Self {
-        Self { kvid, sorts, comment }
+    pub fn new(kvid: T::KVar, sorts: Vec<Sort<T>>, self_args: usize) -> Self {
+        Self { kvid, sorts, self_args }
     }
 }
 
@@ -413,6 +494,8 @@ pub enum ThyFunc {
     Bv32ToInt,
     IntToBv64,
     Bv64ToInt,
+    IntToBv128,
+    Bv128ToInt,
     BvUle,
     BvSle,
     BvUge,
@@ -463,7 +546,7 @@ pub enum ThyFunc {
 }
 
 impl ThyFunc {
-    pub const ALL: [ThyFunc; 44] = [
+    pub const ALL: [ThyFunc; 46] = [
         ThyFunc::StrLen,
         ThyFunc::StrConcat,
         ThyFunc::StrPrefixOf,
@@ -475,6 +558,8 @@ impl ThyFunc {
         ThyFunc::Bv32ToInt,
         ThyFunc::IntToBv64,
         ThyFunc::Bv64ToInt,
+        ThyFunc::IntToBv128,
+        ThyFunc::Bv128ToInt,
         ThyFunc::BvAdd,
         ThyFunc::BvNeg,
         ThyFunc::BvSub,
@@ -530,6 +615,8 @@ impl fmt::Display for ThyFunc {
             ThyFunc::Bv8ToInt => write!(f, "bv8_to_int"),
             ThyFunc::IntToBv64 => write!(f, "int_to_bv64"),
             ThyFunc::Bv64ToInt => write!(f, "bv64_to_int"),
+            ThyFunc::IntToBv128 => write!(f, "int_to_bv128"),
+            ThyFunc::Bv128ToInt => write!(f, "bv128_to_int"),
             ThyFunc::BvUle => write!(f, "bvule"),
             ThyFunc::BvSle => write!(f, "bvsle"),
             ThyFunc::BvUge => write!(f, "bvuge"),
@@ -563,6 +650,58 @@ impl fmt::Display for ThyFunc {
             ThyFunc::MapDefault => write!(f, "Map_default"),
             ThyFunc::MapSelect => write!(f, "Map_select"),
             ThyFunc::MapStore => write!(f, "Map_store"),
+        }
+    }
+}
+
+impl FromStr for ThyFunc {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "strLen" => Ok(ThyFunc::StrLen),
+            "int_to_bv32" => Ok(ThyFunc::IntToBv32),
+            "bv32_to_int" => Ok(ThyFunc::Bv32ToInt),
+            "int_to_bv8" => Ok(ThyFunc::IntToBv8),
+            "bv8_to_int" => Ok(ThyFunc::Bv8ToInt),
+            "int_to_bv64" => Ok(ThyFunc::IntToBv64),
+            "bv64_to_int" => Ok(ThyFunc::Bv64ToInt),
+            "int_to_bv128" => Ok(ThyFunc::IntToBv128),
+            "bv128_to_int" => Ok(ThyFunc::Bv128ToInt),
+            "bvule" => Ok(ThyFunc::BvUle),
+            "bvsle" => Ok(ThyFunc::BvSle),
+            "bvuge" => Ok(ThyFunc::BvUge),
+            "bvsge" => Ok(ThyFunc::BvSge),
+            "bvudiv" => Ok(ThyFunc::BvUdiv),
+            "bvsdiv" => Ok(ThyFunc::BvSdiv),
+            "bvurem" => Ok(ThyFunc::BvUrem),
+            "bvsrem" => Ok(ThyFunc::BvSrem),
+            "bvlshr" => Ok(ThyFunc::BvLshr),
+            "bvashr" => Ok(ThyFunc::BvAshr),
+            "bvand" => Ok(ThyFunc::BvAnd),
+            "bvor" => Ok(ThyFunc::BvOr),
+            "bvxor" => Ok(ThyFunc::BvXor),
+            "bvnot" => Ok(ThyFunc::BvNot),
+            "bvadd" => Ok(ThyFunc::BvAdd),
+            "bvneg" => Ok(ThyFunc::BvNeg),
+            "bvsub" => Ok(ThyFunc::BvSub),
+            "bvmul" => Ok(ThyFunc::BvMul),
+            "bvshl" => Ok(ThyFunc::BvShl),
+            "bvugt" => Ok(ThyFunc::BvUgt),
+            "bvsgt" => Ok(ThyFunc::BvSgt),
+            "bvult" => Ok(ThyFunc::BvUlt),
+            "bvslt" => Ok(ThyFunc::BvSlt),
+            "Set_empty" => Ok(ThyFunc::SetEmpty),
+            "Set_sng" => Ok(ThyFunc::SetSng),
+            "Set_cup" => Ok(ThyFunc::SetCup),
+            "Set_mem" => Ok(ThyFunc::SetMem),
+            "Map_default" => Ok(ThyFunc::MapDefault),
+            "Map_select" => Ok(ThyFunc::MapSelect),
+            "Map_store" => Ok(ThyFunc::MapStore),
+            // TODO: (ck) Fix this?
+            // NOTE: (ck) There isn't a straightforward way to translate
+            // the name of a Z3 node to the BvZeroExtend and BvSignExtend,
+            // so this is a partial parse.
+            _ => Err(format!("Unexpected ThyFunc {}", s)),
         }
     }
 }

@@ -13,8 +13,7 @@ use flux_rustc_bridge::{
     ty::{AdtDef, GenericArgs, GenericArgsExt as _, List, Mutability, Ty, TyKind},
 };
 use itertools::{Itertools, repeat_n};
-use rustc_data_structures::unord::UnordMap;
-use rustc_hash::FxHashMap;
+use rustc_data_structures::{fx::FxHashMap, unord::UnordMap};
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec, bit_set::DenseBitSet};
 use rustc_middle::mir::{FakeReadCause, START_BLOCK};
@@ -31,7 +30,7 @@ pub(crate) fn add_ghost_statements<'tcx>(
     body: &Body<'tcx>,
     fn_sig: Option<&rty::EarlyBinder<rty::PolyFnSig>>,
 ) -> QueryResult {
-    let mut bb_envs = FxHashMap::default();
+    let mut bb_envs = UnordMap::default();
     FoldUnfoldAnalysis::new(genv, body, &mut bb_envs, Infer).run(fn_sig)?;
 
     FoldUnfoldAnalysis::new(genv, body, &mut bb_envs, Elaboration { stmts }).run(fn_sig)
@@ -120,7 +119,7 @@ type Modified = bool;
 struct FoldUnfoldAnalysis<'a, 'genv, 'tcx, M> {
     genv: GlobalEnv<'genv, 'tcx>,
     body: &'a Body<'tcx>,
-    bb_envs: &'a mut FxHashMap<BasicBlock, Env>,
+    bb_envs: &'a mut UnordMap<BasicBlock, Env>,
     visited: DenseBitSet<BasicBlock>,
     queue: WorkQueue<'a>,
     discriminants: UnordMap<Place, Place>,
@@ -212,8 +211,10 @@ impl Mode for Elaboration<'_> {
                     .mode
                     .insert_at(analysis.point, GhostStatement::Fold(place));
             }
+            // `place_ref` is the longest prefix of `place` that `ensure_unfolded` could walk
+            // through. It is a strict prefix when `place` indexes into an array or slice, in
+            // which case we unfold up to the array/slice itself.
             ProjResult::Unfold(place_ref) => {
-                tracked_span_assert_eq!(place_ref, place.as_ref());
                 match place_ref.last_projection() {
                     Some((base, PlaceElem::Deref | PlaceElem::Field(..))) => {
                         analysis
@@ -293,7 +294,7 @@ impl<M: Mode> FoldUnfoldAnalysis<'_, '_, '_, M> {
 
     fn statement(&mut self, stmt: &Statement, env: &mut Env) -> QueryResult {
         match &stmt.kind {
-            StatementKind::FakeRead(box (FakeReadCause::ForIndex, place)) => {
+            StatementKind::FakeRead(deref!((FakeReadCause::ForIndex, place))) => {
                 M::projection(self, env, place)?;
             }
             StatementKind::Assign(place, rvalue) => {
@@ -303,10 +304,7 @@ impl<M: Mode> FoldUnfoldAnalysis<'_, '_, '_, M> {
                         let deref_place = place.deref();
                         M::projection(self, env, &deref_place)?;
                     }
-                    Rvalue::Use(op)
-                    | Rvalue::Cast(_, op, _)
-                    | Rvalue::UnaryOp(_, op)
-                    | Rvalue::ShallowInitBox(op, _) => {
+                    Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => {
                         self.operand(op, env)?;
                     }
                     Rvalue::Ref(.., bk, place) => {
@@ -335,7 +333,6 @@ impl<M: Mode> FoldUnfoldAnalysis<'_, '_, '_, M> {
                     Rvalue::Repeat(op, _) => {
                         self.operand(op, env)?;
                     }
-                    Rvalue::NullaryOp(_, _) => {}
                 }
                 M::projection(self, env, place)?;
             }
@@ -466,7 +463,7 @@ impl<'a, 'genv, 'tcx, M> FoldUnfoldAnalysis<'a, 'genv, 'tcx, M> {
     pub(crate) fn new(
         genv: GlobalEnv<'genv, 'tcx>,
         body: &'a Body<'tcx>,
-        bb_envs: &'a mut FxHashMap<BasicBlock, Env>,
+        bb_envs: &'a mut UnordMap<BasicBlock, Env>,
         mode: M,
     ) -> Self {
         Self {

@@ -13,14 +13,14 @@ use flux_middle::{
     fhir::{self, FhirId, FluxOwnerId, visit::Visitor},
     global_env::GlobalEnv,
     queries::QueryResult,
-    rty::{self, WfckResults},
+    rty::{self, RecordCtor, WfckResults},
 };
+use rustc_data_structures::unord::UnordSet;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hash::FxHashSet;
 use rustc_hir::{
     OwnerId,
     def::DefKind,
-    def_id::{CrateNum, DefId, DefIndex},
+    def_id::{CrateNum, DefId, DefIndex, LocalDefId},
 };
 
 use self::sortck::{ImplicitParamInferer, InferCtxt};
@@ -48,7 +48,7 @@ pub(crate) fn check_flux_item<'genv>(
 
 pub(crate) fn check_constant_expr<'genv>(
     genv: GlobalEnv<'genv, '_>,
-    owner: OwnerId,
+    owner: MaybeExternId<OwnerId>,
     expr: &fhir::Expr<'genv>,
     sort: &rty::Sort,
 ) -> Result<WfckResults> {
@@ -70,7 +70,7 @@ pub(crate) fn check_invariants<'genv>(
     params: &[fhir::RefineParam<'genv>],
     invariants: &[fhir::Expr<'genv>],
 ) -> Result<WfckResults> {
-    let owner = FluxOwnerId::Rust(adt_def_id.local_id());
+    let owner = FluxOwnerId::Rust(adt_def_id);
     let mut infcx = InferCtxt::new(genv, owner);
     Wf::with(&mut infcx, |wf| {
         wf.declare_params_for_invariants(params, invariants)?;
@@ -94,7 +94,7 @@ pub(crate) fn check_node<'genv>(
     genv: GlobalEnv<'genv, '_>,
     node: &fhir::OwnerNode<'genv>,
 ) -> Result<WfckResults> {
-    let mut infcx = InferCtxt::new(genv, node.owner_id().local_id().into());
+    let mut infcx = InferCtxt::new(genv, node.owner_id().into());
     Wf::with(&mut infcx, |wf| {
         wf.init_infcx_for_node(node)
             .map_err(|err| err.at(genv.tcx().def_span(node.owner_id().local_id())))
@@ -103,6 +103,7 @@ pub(crate) fn check_node<'genv>(
         ImplicitParamInferer::infer(wf.infcx, node)?;
 
         wf.check_node(node);
+        wf.check_hides_and_reveals(node.owner_id().local_id().def_id);
         Ok(())
     })?;
 
@@ -141,6 +142,46 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
 
     fn check_node(&mut self, node: &fhir::OwnerNode<'genv>) {
         self.visit_node(node);
+    }
+
+    /// Checks that `#[hide(...)]` and `#[reveal(...)]` have an effect. Hiding an inlined definition
+    /// or revealing an uninterpreted function are errors. Hiding an uninterpreted function or
+    /// revealing a definition that is not hidden by default are warnings.
+    fn check_hides_and_reveals(&mut self, def_id: LocalDefId) {
+        let genv = self.infcx.genv;
+        let attr_map = genv.fhir_attr_map(def_id);
+        for &(revealed, span) in attr_map.reveals {
+            match genv.spec_func(revealed) {
+                rty::SpecFunc::Uif => {
+                    self.errors
+                        .emit(errors::RevealUninterpretedFunction::new(span, revealed));
+                }
+                rty::SpecFunc::Defined { hide: false, .. } => {
+                    genv.sess()
+                        .dcx()
+                        .emit_warn(errors::RevealNotHiddenDefinition::new(span, revealed));
+                }
+                rty::SpecFunc::Defined { hide: true, .. } => {}
+            }
+        }
+        for &(hidden, span) in attr_map.hides {
+            if let rty::SpecFunc::Uif = genv.spec_func(hidden) {
+                genv.sess()
+                    .dcx()
+                    .emit_warn(errors::HideUninterpretedFunction::new(span, hidden));
+            } else if genv.should_inline_fun(hidden) {
+                self.errors
+                    .emit(errors::HideInlinedDefinition::new(span, hidden));
+            }
+            if attr_map
+                .reveals
+                .iter()
+                .any(|(revealed, _)| *revealed == hidden)
+            {
+                self.errors
+                    .emit(errors::HideAndRevealDefinition::new(span, hidden));
+            }
+        }
     }
 
     fn check_expr(&mut self, expr: &fhir::Expr<'genv>, sort: &rty::Sort) {
@@ -277,6 +318,11 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
                         cx.conv_fn_sig(def_id, fn_sig)?;
                         cx.conv_generic_predicates(def_id, &item.generics)?;
                     }
+                    fhir::ItemKind::Static(ty) => {
+                        if let Some(ty) = ty {
+                            cx.conv_static_ty(ty)?;
+                        }
+                    }
                     fhir::ItemKind::Const(_) => {}
                 }
             }
@@ -306,6 +352,9 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
                         cx.conv_fn_sig(def_id, &fn_sig)?;
                         cx.conv_generic_predicates(def_id, generics)?;
                     }
+                    fhir::ForeignItemKind::Static(_, _, _, _) => {
+                        // TODO: conv_ty if we want refinements on extern statics?
+                    }
                 }
             }
         }
@@ -320,10 +369,13 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
                 cx.conv_qualifier(qualifier)?;
             }
             fhir::FluxItem::Func(spec_func) => {
-                cx.conv_defn(spec_func)?;
+                cx.conv_spec_func(spec_func)?;
             }
             fhir::FluxItem::PrimOpProp(prim_op_prop) => {
                 cx.conv_primop_prop(prim_op_prop)?;
+            }
+            fhir::FluxItem::Axiom(axiom) => {
+                cx.conv_axiom(axiom)?;
             }
             fhir::FluxItem::SortDecl(_sort_decl) => {}
         }
@@ -331,7 +383,7 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
     }
 
     fn check_output_locs(&mut self, fn_decl: &fhir::FnDecl) {
-        let mut output_locs = FxHashSet::default();
+        let mut output_locs = UnordSet::new();
         for ens in fn_decl.output.ensures {
             if let fhir::Ensures::Type(loc, ..) = ens
                 && let (_, id) = loc.res.expect_param()
@@ -342,7 +394,7 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
         }
 
         for ty in fn_decl.inputs {
-            if let fhir::TyKind::StrgRef(_, loc, _) = ty.kind
+            if let fhir::TyKind::StrgRef(loc, _) = ty.kind
                 && let (_, id) = loc.res.expect_param()
                 && !output_locs.contains(&id)
             {
@@ -355,6 +407,20 @@ impl<'a, 'genv, 'tcx> Wf<'a, 'genv, 'tcx> {
 impl<'genv> fhir::visit::Visitor<'genv> for Wf<'_, 'genv, '_> {
     fn visit_qualifier(&mut self, qual: &fhir::Qualifier<'genv>) {
         self.check_expr(&qual.expr, &rty::Sort::Bool);
+
+        // A sort with no literals to scrape would silently make the qualifier inert.
+        let wildcards = std::iter::zip(qual.args, qual.wildcards)
+            .filter_map(|(param, &is_wildcard)| is_wildcard.then_some(param));
+        for param in wildcards {
+            let sort = self.infcx.param_sort(param.id);
+            if !matches!(
+                sort,
+                rty::Sort::Int | rty::Sort::Real | rty::Sort::Str | rty::Sort::BitVec(_)
+            ) {
+                self.errors
+                    .emit(errors::InvalidWildcardSort::new(param.span, sort));
+            }
+        }
     }
 
     fn visit_primop_prop(&mut self, primop_prop: &fhir::PrimOpProp<'genv>) {
@@ -374,6 +440,10 @@ impl<'genv> fhir::visit::Visitor<'genv> for Wf<'_, 'genv, '_> {
             return;
         }
         self.check_expr(&primop_prop.body, &rty::Sort::Bool);
+    }
+
+    fn visit_axiom(&mut self, axiom: &fhir::Axiom<'genv>) {
+        self.check_expr(&axiom.body, &rty::Sort::Bool);
     }
 
     fn visit_func(&mut self, func: &fhir::SpecFunc<'genv>) {
@@ -423,6 +493,13 @@ impl<'genv> fhir::visit::Visitor<'genv> for Wf<'_, 'genv, '_> {
         self.check_expr(&ret.idx, &expected);
     }
 
+    fn visit_fn_sig(&mut self, sig: &fhir::FnSig<'genv>) {
+        fhir::visit::walk_fn_sig(self, sig);
+        if let Some(e) = sig.no_panic_if {
+            self.check_expr(&e, &rty::Sort::Bool);
+        }
+    }
+
     fn visit_fn_decl(&mut self, decl: &fhir::FnDecl<'genv>) {
         fhir::visit::walk_fn_decl(self, decl);
         self.check_output_locs(decl);
@@ -451,7 +528,7 @@ impl<'genv> fhir::visit::Visitor<'genv> for Wf<'_, 'genv, '_> {
                 self.check_expr(idx, &expected);
                 self.visit_bty(bty);
             }
-            fhir::TyKind::StrgRef(_, loc, ty) => {
+            fhir::TyKind::StrgRef(loc, ty) => {
                 self.infcx.check_loc(loc).collect_err(&mut self.errors);
                 self.visit_ty(ty);
             }
@@ -582,8 +659,8 @@ impl WfckResultsProvider for InferCtxt<'_, '_> {
         rty::FieldProj::Tuple { arity: 0, field: 0 }
     }
 
-    fn record_ctor(&self, _: FhirId) -> DefId {
-        DefId { index: DefIndex::from_u32(0), krate: CrateNum::from_u32(0) }
+    fn record_ctor(&self, _: FhirId) -> RecordCtor {
+        RecordCtor::Struct(DefId { index: DefIndex::from_u32(0), krate: CrateNum::from_u32(0) })
     }
 
     fn param_sort(&self, param_id: fhir::ParamId) -> rty::Sort {

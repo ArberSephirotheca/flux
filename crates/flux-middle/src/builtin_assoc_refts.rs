@@ -3,14 +3,15 @@ use std::sync::OnceLock;
 use flux_arc_interner::List;
 use flux_common::bug;
 use flux_syntax::symbols::sym;
+use rustc_attr_ir::LangItem;
 use rustc_data_structures::unord::UnordMap;
-use rustc_hir::{LangItem, def_id::DefId};
-use rustc_span::DUMMY_SP;
+use rustc_hir::def_id::DefId;
+use rustc_span::{DUMMY_SP, Symbol};
 
 use crate::{
     def_id::FluxDefId,
     global_env::GlobalEnv,
-    rty::{self, AliasReft, AssocRefinements, AssocReft},
+    rty::{self, AliasReft, AssocRefinements, AssocReft, BaseTy},
 };
 
 impl<'tcx> GlobalEnv<'_, 'tcx> {
@@ -27,16 +28,36 @@ impl<'tcx> GlobalEnv<'_, 'tcx> {
 
                 let mut map = UnordMap::default();
 
+                // FnOnce
+                let fn_once_id = tcx.require_lang_item(LangItem::FnOnce, DUMMY_SP);
+                map.insert(
+                    fn_once_id,
+                    AssocRefinements {
+                        items: List::from_arr([AssocReft::new(
+                            FluxDefId::new(fn_once_id, sym::no_panic),
+                            false,
+                            tcx.def_span(fn_once_id),
+                        )]),
+                    },
+                );
+
                 // Sized
                 let sized_id = tcx.require_lang_item(LangItem::Sized, DUMMY_SP);
                 map.insert(
                     sized_id,
                     AssocRefinements {
-                        items: List::from_arr([AssocReft::new(
-                            FluxDefId::new(def_id, sym::size_of),
-                            false,
-                            tcx.def_span(sized_id),
-                        )]),
+                        items: List::from_arr([
+                            AssocReft::new(
+                                FluxDefId::new(sized_id, sym::size_of),
+                                false,
+                                tcx.def_span(sized_id),
+                            ),
+                            AssocReft::new(
+                                FluxDefId::new(sized_id, sym::align_of),
+                                false,
+                                tcx.def_span(sized_id),
+                            ),
+                        ]),
                     },
                 );
                 map
@@ -61,10 +82,21 @@ impl<'tcx> GlobalEnv<'_, 'tcx> {
 
                 let mut map = UnordMap::default();
 
+                // FnOnce
+                let fn_once_id = tcx.require_lang_item(LangItem::FnOnce, DUMMY_SP);
+                map.insert(
+                    FluxDefId::new(fn_once_id, sym::no_panic),
+                    rty::FuncSort::new(vec![], rty::Sort::Bool),
+                );
+
                 // Sized
                 let sized_id = tcx.require_lang_item(LangItem::Sized, DUMMY_SP);
                 map.insert(
                     FluxDefId::new(sized_id, sym::size_of),
+                    rty::FuncSort::new(vec![], rty::Sort::Int),
+                );
+                map.insert(
+                    FluxDefId::new(sized_id, sym::align_of),
                     rty::FuncSort::new(vec![], rty::Sort::Int),
                 );
                 map
@@ -74,24 +106,60 @@ impl<'tcx> GlobalEnv<'_, 'tcx> {
             .map(rty::EarlyBinder)
     }
 
+    /// Returns the [`FluxDefId`] for a built-in associated refinement given the parent trait's
+    /// [`DefId`] and the assoc reft [`Symbol`]. Panics if no such built-in assoc reft exists.
+    ///
+    /// This is the single source of truth for looking up built-in assoc reft ids; callers should
+    /// use this instead of constructing a [`FluxDefId`] directly.
+    pub fn require_builtin_assoc_reft(self, def_id: DefId, name: Symbol) -> FluxDefId {
+        self.builtin_assoc_refts(def_id)
+            .and_then(|assoc_refts| {
+                assoc_refts
+                    .items
+                    .iter()
+                    .find(|reft| reft.name() == name)
+                    .map(|reft| reft.def_id())
+            })
+            .unwrap_or_else(|| bug!("missing builtin assoc reft `{name}` for `{def_id:?}`"))
+    }
+
+    /// Returns the body of a builtin associated refinement, or `None` if it cannot be computed
+    /// yet, e.g., `size_of` for a type like `W<T>` whose layout depends on a generic parameter.
+    /// In that case the caller should leave the alias unnormalized.
     pub fn builtin_assoc_reft_body(
         self,
         typing_env: rustc_middle::ty::TypingEnv<'tcx>,
         alias_reft: &AliasReft,
-    ) -> rty::Lambda {
+    ) -> Option<rty::Lambda> {
         let tcx = self.tcx();
 
-        if tcx.is_lang_item(alias_reft.assoc_id.parent(), LangItem::Sized)
-            && alias_reft.assoc_id.name() == sym::size_of
-        {
+        if tcx.is_lang_item(alias_reft.assoc_id.parent(), LangItem::Sized) {
             let self_ty = alias_reft.to_rustc_trait_ref(tcx).self_ty();
-            let size = tcx
-                .layout_of(typing_env.as_query_input(self_ty))
-                .unwrap()
-                .size
-                .bytes();
-            let body = rty::Expr::constant(rty::Constant::from(size));
-            rty::Lambda::bind_with_vars(body, List::empty(), rty::Sort::Int)
+            // A type can be `Sized` via a builtin impl and still have a layout that depends on
+            // generic parameters (`W<T>`, `[T; 2]`, ...), so `layout_of` may fail with
+            // `TooGeneric`. Leaving the alias abstract is always sound.
+            let layout = tcx.layout_of(typing_env.as_query_input(self_ty)).ok()?;
+            let body = match alias_reft.assoc_id.name() {
+                sym::size_of => rty::Expr::constant(rty::Constant::from(layout.size.bytes())),
+                sym::align_of => rty::Expr::constant(rty::Constant::from(layout.align.abi.bytes())),
+                _ => bug!("invalid builtin assoc reft {:?}", alias_reft.assoc_id),
+            };
+            Some(rty::Lambda::bind_with_vars(body, List::empty(), rty::Sort::Int))
+        } else if tcx.is_lang_item(alias_reft.assoc_id.parent(), LangItem::FnOnce)
+            && alias_reft.assoc_id.name() == sym::no_panic
+        {
+            let self_ty = alias_reft.self_ty();
+            let body = match self_ty.as_bty_skipping_binder() {
+                BaseTy::Closure(_, _, _, no_panic) => {
+                    if *no_panic {
+                        rty::Expr::tt()
+                    } else {
+                        rty::Expr::ff()
+                    }
+                }
+                _ => rty::Expr::ff(),
+            };
+            Some(rty::Lambda::bind_with_vars(body, List::empty(), rty::Sort::Bool))
         } else {
             bug!("invalid builtin assoc reft {:?}", alias_reft.assoc_id)
         }

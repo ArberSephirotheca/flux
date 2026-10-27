@@ -1,4 +1,5 @@
 pub mod visit;
+
 use std::{borrow::Cow, fmt, ops::Range};
 
 use flux_config::PartialInferOpts;
@@ -6,7 +7,7 @@ pub use rustc_ast::{
     Mutability,
     token::{Lit, LitKind},
 };
-use rustc_hash::FxHashSet;
+use rustc_data_structures::fx::FxIndexSet;
 pub use rustc_span::{Span, symbol::Ident};
 use rustc_span::{Symbol, symbol::sym};
 
@@ -35,23 +36,53 @@ pub enum FluxItem {
     FuncDef(SpecFunc),
     SortDecl(SortDecl),
     PrimOpProp(PrimOpProp),
+    Axiom(Axiom),
+    Use(UseTree),
 }
 
 impl FluxItem {
-    pub fn name(&self) -> Ident {
+    pub fn name(&self) -> Option<Ident> {
         match self {
-            FluxItem::Qualifier(qualifier) => qualifier.name,
-            FluxItem::FuncDef(spec_func) => spec_func.name,
-            FluxItem::SortDecl(sort_decl) => sort_decl.name,
-            FluxItem::PrimOpProp(primop_prop) => primop_prop.name,
+            FluxItem::Qualifier(qualifier) => Some(qualifier.name),
+            FluxItem::FuncDef(spec_func) => Some(spec_func.name),
+            FluxItem::SortDecl(sort_decl) => Some(sort_decl.name),
+            FluxItem::PrimOpProp(primop_prop) => Some(primop_prop.name),
+            FluxItem::Axiom(axiom) => Some(axiom.name),
+            FluxItem::Use(_) => None,
         }
     }
+
+    pub fn sort_vars(&self) -> &[Ident] {
+        match self {
+            FluxItem::FuncDef(defn) => &defn.sort_vars[..],
+            FluxItem::SortDecl(sort_decl) => &sort_decl.sort_vars[..],
+            FluxItem::Qualifier(_)
+            | FluxItem::PrimOpProp(_)
+            | FluxItem::Axiom(_)
+            | FluxItem::Use(_) => &[],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UseTree {
+    pub prefix: ExprPath,
+    pub kind: UseTreeKind,
+}
+
+#[derive(Debug)]
+pub enum UseTreeKind {
+    /// `use a::b::c`
+    Simple,
+    /// `use a::b::{...}`
+    Nested(Vec<UseTree>),
 }
 
 #[derive(Debug)]
 pub struct Qualifier {
     pub name: Ident,
     pub params: RefineParams,
+    pub wildcards: Vec<bool>,
     pub expr: Expr,
     pub span: Span,
     pub kind: QualifierKind,
@@ -95,6 +126,19 @@ pub struct PrimOpProp {
     pub span: Span,
 }
 
+/// A (global) *axiom*, i.e., a fact (typically about uninterpreted functions) that is assumed to
+/// hold for all values of its parameters; see tests/tests/pos/surface/axiom00.rs
+#[derive(Debug)]
+pub struct Axiom {
+    /// The name of the axiom
+    pub name: Ident,
+    /// The (universally quantified) binders of the axiom
+    pub params: RefineParams,
+    /// The actual definition of the axiom, which must have sort `bool`
+    pub body: Expr,
+    pub span: Span,
+}
+
 #[derive(Debug)]
 pub struct Generics {
     pub params: Vec<GenericParam>,
@@ -133,6 +177,7 @@ pub enum ItemKind {
     Impl(Impl),
     Const(ConstantInfo),
     TyAlias(Box<TyAlias>),
+    Static(StaticInfo),
     /// Modules can't be refined but we collect attributes for them, e.g., `#[trusted]`
     /// This kind is also used for the crate root, for which we also collect attributes.
     Mod,
@@ -219,11 +264,17 @@ pub enum DetachedItemKind {
     InherentImpl(DetachedInherentImpl),
     TraitImpl(DetachedTraitImpl),
     Trait(DetachedTrait),
+    Static(StaticInfo),
 }
 
 #[derive(Debug)]
 pub struct ConstantInfo {
     pub expr: Option<Expr>,
+}
+
+#[derive(Debug)]
+pub struct StaticInfo {
+    pub ty: Ty,
 }
 
 #[derive(Debug)]
@@ -295,6 +346,8 @@ pub enum BaseSort {
     BitVec(u32),
     SortOf(Box<Ty>, Path),
     Path(SortPath),
+    /// a tuple sort, e.g., (int, bool)
+    Tuple(Vec<BaseSort>),
 }
 
 /// A [`Path`] but for sorts.
@@ -305,6 +358,16 @@ pub struct SortPath {
     /// The sort arguments, i.e., the list `[int, bool]` in `Map<int, bool>`.
     pub args: Vec<BaseSort>,
     pub node_id: NodeId,
+}
+
+impl SortPath {
+    pub fn span(&self) -> Span {
+        self.segments
+            .iter()
+            .map(|ident| ident.span)
+            .reduce(Span::to)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -352,6 +415,7 @@ pub struct FnSig {
     /// source span
     pub span: Span,
     pub node_id: NodeId,
+    pub no_panic: Option<Expr>,
 }
 
 #[derive(Debug)]
@@ -465,9 +529,31 @@ pub enum TyKind {
     Constr(Expr, Box<Ty>),
     Tuple(Vec<Ty>),
     Array(Box<Ty>, ConstArg),
+    /// A function pointer type, e.g., `fn(i32) -> i32{v: v > 0}`
+    BareFn(Box<BareFnTy>),
     /// The `NodeId` is used to resolve the type to a corresponding `OpaqueTy`
     ImplTrait(NodeId, GenericBounds),
     Hole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Safety {
+    Safe,
+    Unsafe,
+}
+
+#[derive(Debug)]
+pub struct BareFnTy {
+    /// Whether the fn pointer is `unsafe`
+    pub safety: Safety,
+    /// The abi of an `extern "abi" fn` pointer (`extern fn` is `extern "C" fn`), or `None` for the
+    /// default (rust) abi.
+    pub abi: Option<Ident>,
+    /// example `&T[@n]`. `@` binders in the inputs are bound by the fn pointer type itself
+    pub inputs: Vec<Ty>,
+    pub output: FnRetTy,
+    pub node_id: NodeId,
+    pub span: Span,
 }
 
 impl Ty {
@@ -476,12 +562,13 @@ impl Ty {
             is_refined: bool,
         }
         let mut vis = IsRefinedVisitor { is_refined: false };
-        impl visit::Visitor for IsRefinedVisitor {
+        impl visit::Visitor<'_> for IsRefinedVisitor {
             fn visit_ty(&mut self, ty: &Ty) {
                 match &ty.kind {
                     TyKind::Tuple(_)
                     | TyKind::Ref(..)
                     | TyKind::Array(..)
+                    | TyKind::BareFn(..)
                     | TyKind::ImplTrait(..)
                     | TyKind::Hole
                     | TyKind::Base(_) => {
@@ -522,17 +609,20 @@ pub struct BaseTy {
 pub enum BaseTyKind {
     Path(Option<Box<Ty>>, Path),
     Slice(Box<Ty>),
+    /// Raw pointer (*const T or *mut T), optionally with refinement on pointer value
+    Ptr(Mutability, Box<Ty>),
 }
 
-#[derive(PartialEq, Eq, Clone, Debug, Copy)]
+#[derive(Debug)]
 pub struct ConstArg {
     pub kind: ConstArgKind,
     pub span: Span,
 }
 
-#[derive(PartialEq, Eq, Clone, Debug, Copy)]
+#[derive(Debug)]
 pub enum ConstArgKind {
     Lit(usize),
+    Path(Path),
     Infer,
 }
 
@@ -614,6 +704,8 @@ pub enum Attr {
     Trusted(Trusted),
     /// A `#[trusted_impl(...)]` attribute
     TrustedImpl(Trusted),
+    /// A `#[trusted_derive(...)]` attribute
+    TrustedDerive(Trusted),
     /// A `#[ignore(...)]` attribute
     Ignore(Ignored),
     /// A `#[proven_externally]` attribute
@@ -624,10 +716,16 @@ pub enum Attr {
     Qualifiers(Vec<Ident>),
     /// A `#[reveal(...)]` attribute
     Reveal(Vec<Ident>),
+    /// A `#[hide(...)]` attribute
+    Hide(Vec<Ident>),
     /// A `#[opts(...)]` attribute
     InferOpts(PartialInferOpts),
     /// A `#[no_panic]` attribute
     NoPanic,
+    /// A `#[assume_parametric(...)]` attribute
+    AssumeParametric(Vec<Ident>),
+    /// A `#[no_suggestions]` attribute
+    NoSuggestions,
 }
 
 #[derive(Debug)]
@@ -668,7 +766,7 @@ pub enum GenericArgKind {
 #[derive(Debug)]
 pub struct FieldExpr {
     pub ident: Ident,
-    pub expr: Expr,
+    pub expr: RefineArg,
     pub span: Span,
     pub node_id: NodeId,
 }
@@ -713,10 +811,12 @@ pub enum ExprKind {
     AssocReft(Box<Ty>, Path, Ident),
     IfThenElse(Box<[Expr; 3]>),
     Constructor(Option<ExprPath>, Vec<ConstructorArg>),
-    BoundedQuant(QuantKind, RefineParam, Range<usize>, Box<Expr>),
+    Quant(QuantKind, RefineParam, Option<Range<usize>>, Box<Expr>),
     Block(Vec<LetDecl>, Box<Expr>),
     /// Set expression `#{ e1, e2, ..., en }`
     SetLiteral(Vec<Expr>),
+    /// Tuple expression `(e1, e2, ..., en)`
+    Tuple(Vec<Expr>),
 }
 
 #[derive(Debug)]
@@ -884,25 +984,40 @@ impl<T, P> Punctuated<T, P> {
 impl Expr {
     /// Collects all free variables in an expression.
     /// A free variable is an `ExprKind::Path` with a single identifier segment.
-    pub fn free_vars(&self) -> FxHashSet<Ident> {
+    ///
+    /// Variables are returned in the order they first appear in the expression.
+    pub fn free_vars(&self) -> FxIndexSet<Ident> {
         struct FreeVarsVisitor {
-            vars: FxHashSet<Ident>,
+            vars: FxIndexSet<Ident>,
         }
 
-        impl visit::Visitor for FreeVarsVisitor {
+        impl visit::Visitor<'_> for FreeVarsVisitor {
             fn visit_expr(&mut self, expr: &Expr) {
-                if let ExprKind::Path(path) = &expr.kind {
-                    // Only collect paths with a single segment
-                    if let [segment] = path.segments.as_slice() {
-                        self.vars.insert(segment.ident);
+                match &expr.kind {
+                    ExprKind::Path(path) => {
+                        // Only collect paths with a single segment
+                        if let [segment] = path.segments.as_slice() {
+                            self.vars.insert(segment.ident);
+                        }
                     }
+                    ExprKind::Call(callee, args) => {
+                        // The callee of a call is a refinement function, not a variable, so
+                        // don't collect it. Anything that's not a path may contain free
+                        // variables, so visit it normally.
+                        if !matches!(&callee.kind, ExprKind::Path(_)) {
+                            self.visit_expr(callee);
+                        }
+                        for arg in args {
+                            self.visit_expr(arg);
+                        }
+                    }
+                    // Continue visiting child expressions
+                    _ => visit::walk_expr(self, expr),
                 }
-                // Continue visiting child expressions
-                visit::walk_expr(self, expr);
             }
         }
 
-        let mut visitor = FreeVarsVisitor { vars: FxHashSet::default() };
+        let mut visitor = FreeVarsVisitor { vars: FxIndexSet::default() };
         visitor.visit_expr(self);
         visitor.vars
     }

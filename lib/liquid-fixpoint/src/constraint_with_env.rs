@@ -1,17 +1,25 @@
+#[cfg(feature = "rust-fixpoint")]
+use std::collections::HashMap;
+
 use derive_where::derive_where;
+use itertools::Itertools;
+use rustc_data_structures::fx::FxIndexMap;
 #[cfg(feature = "rust-fixpoint")]
 use {
     crate::{
-        FixpointStatus, Sort, SortCtor,
+        FixpointStatus, Identifier,
         cstr2smt2::{Env, is_constraint_satisfiable, new_binding, new_datatype},
-        graph,
     },
-    itertools::Itertools,
-    std::collections::{HashMap, VecDeque},
+    std::collections::VecDeque,
     z3::Solver,
 };
 
-#[allow(unused)]
+use crate::{
+    ConstDecl, DataDecl, KVarDecl, Sort, SortCtor, Types,
+    constraint::{Constraint, Qualifier},
+    graph,
+};
+
 #[derive_where(Hash)]
 pub struct ConstraintWithEnv<T: Types> {
     datatype_decls: Vec<DataDecl<T>>,
@@ -22,10 +30,6 @@ pub struct ConstraintWithEnv<T: Types> {
 }
 #[cfg(feature = "rust-fixpoint")]
 use crate::Assignments;
-use crate::{
-    ConstDecl, DataDecl, KVarDecl, Types,
-    constraint::{Constraint, Qualifier},
-};
 
 #[cfg(not(feature = "rust-fixpoint"))]
 impl<T: Types> ConstraintWithEnv<T> {
@@ -50,7 +54,7 @@ impl<T: Types> ConstraintWithEnv<T> {
         constants: Vec<ConstDecl<T>>,
         constraint: Constraint<T>,
     ) -> Self {
-        let datatype_decls = Self::topo_sort_data_declarations(datatype_decls);
+        let datatype_decls = topo_sort_data_declarations(datatype_decls);
         Self { datatype_decls, kvar_decls, qualifiers, constants, constraint }
     }
 
@@ -61,6 +65,11 @@ impl<T: Types> ConstraintWithEnv<T> {
             let kvar_arg_count = decl.sorts.len();
             assignments.insert(decl.kvid.clone(), vec![]);
             for qualifier in &self.qualifiers {
+                // TODO: assignments index into the kvar's arguments, so there's no way to name a
+                // literal here. Skip wildcards rather than silently treat them as ordinary params.
+                if qualifier.args.iter().any(|param| param.is_wildcard) {
+                    continue;
+                }
                 let qualifier_arg_count = qualifier.args.len();
                 for argument_combination in (0..kvar_arg_count).combinations(qualifier_arg_count) {
                     assignments.get_mut(&decl.kvid).unwrap().extend(
@@ -129,12 +138,7 @@ impl<T: Types> ConstraintWithEnv<T> {
         }
     }
 
-    fn simplify(&mut self) {
-        self.constraint.simplify();
-    }
-
     pub fn solve_by_fusion(&mut self) -> FixpointStatus<T::Tag> {
-        self.simplify();
         self.eliminate_acyclic_kvars();
         self.solve_by_predicate_abstraction()
     }
@@ -145,7 +149,7 @@ impl<T: Types> ConstraintWithEnv<T> {
         self.constants.iter().for_each(|const_decl| {
             vars.insert(
                 const_decl.name.clone(),
-                new_binding(&const_decl.name, &const_decl.sort, &vars),
+                new_binding(&const_decl.name.display().to_string(), &const_decl.sort, &vars),
             );
         });
         self.datatype_decls.iter().for_each(|data_decl| {
@@ -156,35 +160,42 @@ impl<T: Types> ConstraintWithEnv<T> {
         self.constraint = self.constraint.sub_all_kvars(&kvar_assignment);
         is_constraint_satisfiable(&self.constraint, &solver, &mut vars)
     }
+}
 
-    fn topo_sort_data_declarations(datatype_decls: Vec<DataDecl<T>>) -> Vec<DataDecl<T>> {
-        let mut datatype_dependencies: HashMap<T::Sort, Vec<T::Sort>> = HashMap::new();
-        for datatype_decl in &datatype_decls {
-            datatype_dependencies.insert(datatype_decl.name.clone(), vec![]);
-        }
-        let mut data_decls_by_name = HashMap::new();
-        for datatype_decl in datatype_decls {
-            for data_constructor in &datatype_decl.ctors {
-                for accessor in &data_constructor.fields {
-                    if let Sort::App(ctor, _) = &accessor.sort
-                        && let SortCtor::Data(data_ctor) = &ctor
-                    {
-                        datatype_dependencies
-                            .get_mut(&datatype_decl.name)
-                            .unwrap()
-                            .push(data_ctor.clone());
-                    }
+pub fn topo_sort_data_declarations<T: Types>(datatype_decls: Vec<DataDecl<T>>) -> Vec<DataDecl<T>> {
+    let mut datatype_dependencies: FxIndexMap<T::Sort, Vec<T::Sort>> = FxIndexMap::default();
+    for datatype_decl in &datatype_decls {
+        datatype_dependencies.insert(datatype_decl.name.clone(), vec![]);
+    }
+    let mut data_decls_by_name = FxIndexMap::default();
+    for datatype_decl in datatype_decls {
+        for data_constructor in &datatype_decl.ctors {
+            for accessor in &data_constructor.fields {
+                if let Sort::App(ctor, _) = &accessor.sort
+                    && let SortCtor::Data(data_ctor) = &ctor
+                    // We skip undeclared opaque sorts, which are currently
+                    // encoded as Int.
+                    && datatype_dependencies.contains_key(data_ctor)
+                {
+                    datatype_dependencies
+                        .get_mut(&datatype_decl.name)
+                        .unwrap()
+                        .push(data_ctor.clone());
                 }
             }
-            data_decls_by_name.insert(datatype_decl.name.clone(), datatype_decl);
         }
-        graph::topological_sort_sccs(&datatype_dependencies)
-            .into_iter()
-            .flatten()
-            .rev()
-            .map(|datatype_decl_name| data_decls_by_name.remove(&datatype_decl_name).unwrap())
-            .collect_vec()
+        data_decls_by_name.insert(datatype_decl.name.clone(), datatype_decl);
     }
+    graph::topological_sort_sccs(&datatype_dependencies)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|datatype_decl_name| {
+            data_decls_by_name
+                .shift_remove(&datatype_decl_name)
+                .unwrap()
+        })
+        .collect_vec()
 }
 
 #[cfg(feature = "rust-fixpoint")]
@@ -197,7 +208,7 @@ fn type_signature_matches<T: Types>(
         return false;
     }
 
-    for (qs, ks) in qualifier.args.iter().map(|arg| arg.1.clone()).zip(
+    for (qs, ks) in qualifier.args.iter().map(|param| param.sort.clone()).zip(
         argument_permutation
             .iter()
             .map(|arg_idx| kvar_decl.sorts[*arg_idx].clone()),

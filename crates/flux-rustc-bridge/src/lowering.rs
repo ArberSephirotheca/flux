@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use flux_arc_interner::List;
 use flux_common::result::ResultExt;
 use flux_errors::FluxSession;
@@ -24,21 +26,22 @@ use rustc_trait_selection::traits::SelectionContext;
 use super::{
     mir::{
         AggregateKind, AssertKind, BasicBlockData, BinOp, Body, CallArgs, CastKind, LocalDecl,
-        NonDivergingIntrinsic, NullOp, Operand, Place, PlaceElem, PointerCast, Rvalue, Statement,
+        NonDivergingIntrinsic, Operand, Place, PlaceElem, PointerCast, Rvalue, Statement,
         StatementKind, Terminator, TerminatorKind,
     },
     ty::{
-        AdtDef, AdtDefData, AliasKind, Binder, BoundRegion, BoundVariableKind, Clause, ClauseKind,
-        Const, ConstKind, ExistentialPredicate, ExistentialProjection, FieldDef, FnSig, GenericArg,
-        GenericParamDef, GenericParamDefKind, GenericPredicates, Generics, OutlivesPredicate,
-        TraitPredicate, TraitRef, Ty, TypeOutlivesPredicate, UnevaluatedConst, VariantDef,
+        AdtDef, AdtDefData, AliasConst, AliasConstKind, AliasKind, Binder, BoundRegion,
+        BoundVariableKind, Clause, ClauseKind, Const, ConstKind, ExistentialPredicate,
+        ExistentialProjection, FieldDef, FnSig, GenericArg, GenericParamDef, GenericParamDefKind,
+        GenericPredicates, Generics, OutlivesPredicate, TraitPredicate, TraitRef, Ty,
+        TypeOutlivesPredicate, VariantDef,
     },
 };
 use crate::{
-    mir::{BodyRoot, CallKind, ConstOperand},
+    mir::{BodyKind, BodyRoot, CallKind, ConstOperand},
     ty::{
-        AliasTy, ExistentialTraitRef, GenericArgs, ProjectionPredicate, Region,
-        RegionOutlivesPredicate,
+        AliasTerm, AliasTermKind, BoundRegionKind, ExistentialTraitRef, GenericArgs,
+        ProjectionPredicate, Region, RegionOutlivesPredicate,
     },
 };
 
@@ -97,7 +100,7 @@ fn trait_ref_impl_id<'tcx>(
     let trait_ref = tcx.erase_and_anonymize_regions(trait_ref);
     let obligation = Obligation::new(tcx, ObligationCause::dummy(), param_env, trait_ref);
     let impl_source = selcx.select(&obligation).ok()??;
-    let impl_source = selcx.infcx.resolve_vars_if_possible(impl_source);
+    let impl_source = selcx.infcx.deeply_resolve_ignoring_regions(impl_source);
     // let impl_source = selcx.infcx.fully_resolve(impl_source).ok()?;
     let ImplSource::UserDefined(impl_data) = impl_source else { return None };
     Some((impl_data.impl_def_id, impl_data.args))
@@ -116,7 +119,7 @@ pub fn resolve_trait_ref_impl_id<'tcx>(
     trait_ref_impl_id(tcx, &mut SelectionContext::new(&infcx), param_env, trait_ref)
 }
 
-fn resolve_call_query<'tcx>(
+pub fn resolve_call_query<'tcx>(
     tcx: TyCtxt<'tcx>,
     selcx: &mut SelectionContext<'_, 'tcx>,
     param_env: ParamEnv<'tcx>,
@@ -127,7 +130,7 @@ fn resolve_call_query<'tcx>(
     let trait_ref = rustc_ty::TraitRef::from_assoc(tcx, trait_id, args);
     let (impl_def_id, impl_args) = trait_ref_impl_id(tcx, selcx, param_env, trait_ref)?;
     let impl_args = args.rebase_onto(tcx, trait_id, impl_args);
-    let assoc_id = tcx.impl_item_implementor_ids(impl_def_id).get(&callee_id)?;
+    let assoc_id = *tcx.impl_item_implementor_ids(impl_def_id).get(&callee_id)?;
     let assoc_item = tcx.associated_item(assoc_id);
     Some((assoc_item.def_id, impl_args))
 }
@@ -144,29 +147,32 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
         tcx: TyCtxt<'tcx>,
         sess: &'sess FluxSession,
         def_id: LocalDefId,
-        body_with_facts: BodyWithBorrowckFacts<'tcx>,
+        body_with_facts: Rc<BodyWithBorrowckFacts<'tcx>>,
     ) -> Result<BodyRoot<'tcx>, ErrorGuaranteed> {
         let infcx = tcx
             .infer_ctxt()
             .with_next_trait_solver(true)
             .build(TypingMode::analysis_in_body(tcx, def_id));
-        let rustc_body = body_with_facts.body;
-        let def_id = rustc_body.source.def_id();
+        let def_id = body_with_facts.body.source.def_id();
 
-        let body = Self::lower_rustc_body(tcx, &infcx, sess, def_id, rustc_body)?;
+        let body =
+            Self::lower_rustc_body(tcx, &infcx, sess, def_id, &body_with_facts, BodyKind::Main)?;
         let promoted = body_with_facts
             .promoted
-            .into_iter()
-            .map(|rustc_promoted| Self::lower_rustc_body(tcx, &infcx, sess, def_id, rustc_promoted))
+            .indices()
+            .map(|promoted| {
+                Self::lower_rustc_body(
+                    tcx,
+                    &infcx,
+                    sess,
+                    def_id,
+                    &body_with_facts,
+                    BodyKind::Promoted(promoted),
+                )
+            })
             .try_collect()?;
 
-        let body_root = BodyRoot::new(
-            body_with_facts.borrow_set,
-            body_with_facts.region_inference_context,
-            infcx,
-            body,
-            promoted,
-        );
+        let body_root = BodyRoot::new(body_with_facts, infcx, body, promoted);
         Ok(body_root)
     }
 
@@ -175,11 +181,13 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
         infcx: &InferCtxt<'tcx>,
         sess: &'sess FluxSession,
         def_id: DefId,
-        body: rustc_mir::Body<'tcx>,
+        facts: &Rc<BodyWithBorrowckFacts<'tcx>>,
+        kind: BodyKind,
     ) -> Result<Body<'tcx>, ErrorGuaranteed> {
+        let body = kind.select_body(facts);
         let selcx = SelectionContext::new(infcx);
         let param_env = tcx.param_env(def_id);
-        let mut lower = MirLoweringCtxt { tcx, selcx, param_env, sess, rustc_mir: &body };
+        let mut lower = MirLoweringCtxt { tcx, selcx, param_env, sess, rustc_mir: body };
 
         let basic_blocks = body
             .basic_blocks
@@ -193,7 +201,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
             .map(|local_decl| lower.lower_local_decl(local_decl))
             .try_collect()?;
 
-        Ok(Body::new(basic_blocks, local_decls, body))
+        Ok(Body::new(basic_blocks, local_decls, Rc::clone(facts), kind))
     }
 
     fn lower_basic_block_data(
@@ -236,7 +244,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
     ) -> Result<Statement<'tcx>, ErrorGuaranteed> {
         let span = stmt.source_info.span;
         let kind = match &stmt.kind {
-            rustc_mir::StatementKind::Assign(box (place, rvalue)) => {
+            rustc_mir::StatementKind::Assign(deref!((place, rvalue))) => {
                 StatementKind::Assign(
                     lower_place(self.tcx, place)
                         .map_err(|reason| errors::UnsupportedMir::statement(span, reason))
@@ -254,7 +262,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
                     *variant_index,
                 )
             }
-            rustc_mir::StatementKind::FakeRead(box (cause, place)) => {
+            rustc_mir::StatementKind::FakeRead(deref!((cause, place))) => {
                 StatementKind::FakeRead(Box::new((
                     *cause,
                     lower_place(self.tcx, place)
@@ -273,7 +281,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
             | rustc_mir::StatementKind::StorageLive(_)
             | rustc_mir::StatementKind::StorageDead(_) => StatementKind::Nop,
             rustc_mir::StatementKind::AscribeUserType(
-                box (place, rustc_mir::UserTypeProjection { projs, .. }),
+                deref!((place, rustc_mir::UserTypeProjection { projs, .. })),
                 variance,
             ) if projs.is_empty() => {
                 StatementKind::AscribeUserType(
@@ -298,9 +306,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
                 }
             }
 
-            rustc_mir::StatementKind::Retag(_, _)
-            | rustc_mir::StatementKind::Deinit(_)
-            | rustc_mir::StatementKind::AscribeUserType(..)
+            rustc_mir::StatementKind::AscribeUserType(..)
             | rustc_mir::StatementKind::Coverage(_)
             | rustc_mir::StatementKind::ConstEvalCounter
             | rustc_mir::StatementKind::BackwardIncompatibleDropHint { .. } => {
@@ -322,6 +328,14 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
                     let func_ty = func.ty(self.rustc_mir, self.tcx);
                     match func_ty.kind() {
                         rustc_middle::ty::TyKind::FnDef(fn_def, args) => {
+                            let args = args
+                                .no_bound_vars()
+                                .ok_or_else(|| {
+                                    let reason =
+                                        UnsupportedReason::new("late-bound args in `FnDef`");
+                                    errors::UnsupportedMir::terminator(span, reason)
+                                })
+                                .emit(self.sess)?;
                             let lowered = args
                                 .lower(self.tcx)
                                 .map_err(|reason| errors::UnsupportedMir::terminator(span, reason))
@@ -396,7 +410,9 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
                     targets: targets.clone(),
                 }
             }
-            rustc_mir::TerminatorKind::Goto { target } => TerminatorKind::Goto { target: *target },
+            rustc_mir::TerminatorKind::Goto { target, .. } => {
+                TerminatorKind::Goto { target: *target }
+            }
             rustc_mir::TerminatorKind::Drop { place, target, unwind, .. } => {
                 TerminatorKind::Drop {
                     place: lower_place(self.tcx, place)
@@ -471,7 +487,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
         rvalue: &rustc_mir::Rvalue<'tcx>,
     ) -> Result<Rvalue<'tcx>, UnsupportedReason> {
         match rvalue {
-            rustc_mir::Rvalue::Use(op) => Ok(Rvalue::Use(self.lower_operand(op)?)),
+            rustc_mir::Rvalue::Use(op, retag) => Ok(Rvalue::Use(self.lower_operand(op)?, *retag)),
             rustc_mir::Rvalue::Repeat(op, c) => {
                 let op = self.lower_operand(op)?;
                 let c = c.lower(self.tcx)?;
@@ -491,15 +507,12 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
                 let ty = ty.lower(self.tcx)?;
                 Ok(Rvalue::Cast(kind, op, ty))
             }
-            rustc_mir::Rvalue::BinaryOp(bin_op, box (op1, op2)) => {
+            rustc_mir::Rvalue::BinaryOp(bin_op, deref!((op1, op2))) => {
                 Ok(Rvalue::BinaryOp(
                     self.lower_bin_op(*bin_op)?,
                     self.lower_operand(op1)?,
                     self.lower_operand(op2)?,
                 ))
-            }
-            rustc_mir::Rvalue::NullaryOp(null_op, ty) => {
-                Ok(Rvalue::NullaryOp(self.lower_null_op(*null_op)?, ty.lower(self.tcx)?))
             }
             rustc_mir::Rvalue::UnaryOp(un_op, op) => {
                 Ok(Rvalue::UnaryOp(*un_op, self.lower_operand(op)?))
@@ -512,11 +525,9 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
                 let args = args.iter().map(|op| self.lower_operand(op)).try_collect()?;
                 Ok(Rvalue::Aggregate(aggregate_kind, args))
             }
-            rustc_mir::Rvalue::ShallowInitBox(op, ty) => {
-                Ok(Rvalue::ShallowInitBox(self.lower_operand(op)?, ty.lower(self.tcx)?))
-            }
             rustc_mir::Rvalue::ThreadLocalRef(_)
             | rustc_mir::Rvalue::CopyForDeref(_)
+            | rustc_mir::Rvalue::Reborrow { .. }
             | rustc_mir::Rvalue::WrapUnsafeBinder(..) => {
                 Err(UnsupportedReason::new(format!("unsupported rvalue `{rvalue:?}`")))
             }
@@ -535,8 +546,8 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
             rustc_adjustment::PointerCoercion::ClosureFnPointer(_) => {
                 Some(crate::mir::PointerCast::ClosureFnPointer)
             }
-            rustc_adjustment::PointerCoercion::ReifyFnPointer => {
-                Some(crate::mir::PointerCast::ReifyFnPointer)
+            rustc_adjustment::PointerCoercion::ReifyFnPointer(safety) => {
+                Some(crate::mir::PointerCast::ReifyFnPointer(safety))
             }
             rustc_adjustment::PointerCoercion::UnsafeFnPointer
             | rustc_adjustment::PointerCoercion::ArrayToPointer => None,
@@ -547,6 +558,7 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
             rustc_mir::CastKind::IntToInt => Some(CastKind::IntToInt),
             rustc_mir::CastKind::IntToFloat => Some(CastKind::IntToFloat),
             rustc_mir::CastKind::FloatToInt => Some(CastKind::FloatToInt),
+            rustc_mir::CastKind::FloatToFloat => Some(CastKind::FloatToFloat),
             rustc_mir::CastKind::PtrToPtr => Some(CastKind::PtrToPtr),
             rustc_mir::CastKind::PointerCoercion(ptr_coercion, _) => {
                 Some(CastKind::PointerCoercion(self.lower_pointer_coercion(ptr_coercion)?))
@@ -631,18 +643,6 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
         }
     }
 
-    fn lower_null_op(&self, null_op: rustc_mir::NullOp) -> Result<NullOp, UnsupportedReason> {
-        match null_op {
-            rustc_mir::NullOp::SizeOf => Ok(NullOp::SizeOf),
-            rustc_mir::NullOp::AlignOf => Ok(NullOp::AlignOf),
-            rustc_mir::NullOp::OffsetOf(_)
-            | rustc_mir::NullOp::UbChecks
-            | rustc_mir::NullOp::ContractChecks => {
-                Err(UnsupportedReason::new(format!("unsupported nullary op `{null_op:?}`")))
-            }
-        }
-    }
-
     fn lower_operand(
         &self,
         op: &rustc_mir::Operand<'tcx>,
@@ -651,6 +651,9 @@ impl<'sess, 'tcx> MirLoweringCtxt<'_, 'sess, 'tcx> {
             rustc_mir::Operand::Copy(place) => Ok(Operand::Copy(lower_place(self.tcx, place)?)),
             rustc_mir::Operand::Move(place) => Ok(Operand::Move(lower_place(self.tcx, place)?)),
             rustc_mir::Operand::Constant(c) => Ok(Operand::Constant(self.lower_constant(c)?)),
+            rustc_mir::Operand::RuntimeChecks(..) => {
+                Err(UnsupportedReason::new(format!("unsupported operand `{op:?}`")))
+            }
         }
     }
 
@@ -711,19 +714,19 @@ impl<'tcx> Lower<'tcx> for rustc_ty::FnSig<'tcx> {
                 .map(|ty| ty.lower(tcx))
                 .try_collect()?,
         );
-        Ok(FnSig { safety: self.safety, abi: self.abi, inputs_and_output })
+        Ok(FnSig { safety: self.safety(), abi: self.abi(), inputs_and_output })
     }
 }
 
-impl<'tcx> Lower<'tcx> for &'tcx rustc_ty::List<rustc_ty::BoundVariableKind> {
+impl<'tcx> Lower<'tcx> for &'tcx rustc_ty::List<rustc_ty::BoundVariableKind<'tcx>> {
     type R = Result<List<BoundVariableKind>, UnsupportedReason>;
 
-    fn lower(self, _tcx: TyCtxt<'tcx>) -> Self::R {
+    fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
         let mut vars = vec![];
         for var in self {
             match var {
                 rustc_ty::BoundVariableKind::Region(kind) => {
-                    vars.push(BoundVariableKind::Region(kind));
+                    vars.push(BoundVariableKind::Region(kind.lower(tcx)));
                 }
                 _ => {
                     return Err(UnsupportedReason {
@@ -736,15 +739,30 @@ impl<'tcx> Lower<'tcx> for &'tcx rustc_ty::List<rustc_ty::BoundVariableKind> {
     }
 }
 
-impl<'tcx> Lower<'tcx> for rustc_ty::ValTree<'tcx> {
-    type R = crate::ty::ValTree;
+impl<'tcx> Lower<'tcx> for rustc_ty::BoundRegionKind<'tcx> {
+    type R = BoundRegionKind;
 
     fn lower(self, _tcx: TyCtxt<'tcx>) -> Self::R {
+        match self {
+            rustc_ty::BoundRegionKind::Anon => BoundRegionKind::Anon,
+            rustc_ty::BoundRegionKind::NamedForPrinting(name) => {
+                BoundRegionKind::NamedForPrinting(name)
+            }
+            rustc_ty::BoundRegionKind::Named(def_id) => BoundRegionKind::Named(def_id),
+            rustc_ty::BoundRegionKind::ClosureEnv => BoundRegionKind::ClosureEnv,
+        }
+    }
+}
+
+impl<'tcx> Lower<'tcx> for rustc_ty::ValTree<'tcx> {
+    type R = Result<crate::ty::ValTree, UnsupportedReason>;
+
+    fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
         match &*self {
-            rustc_ty::ValTreeKind::Leaf(scalar_int) => crate::ty::ValTree::Leaf(*scalar_int),
-            rustc_ty::ValTreeKind::Branch(trees) => {
-                let trees = trees.iter().map(|tree| tree.lower(_tcx)).collect();
-                crate::ty::ValTree::Branch(trees)
+            rustc_ty::ValTreeKind::Leaf(scalar_int) => Ok(crate::ty::ValTree::Leaf(*scalar_int)),
+            rustc_ty::ValTreeKind::Branch(consts) => {
+                let trees = consts.iter().map(|c| c.lower(tcx)).try_collect()?;
+                Ok(crate::ty::ValTree::Branch(trees))
             }
         }
     }
@@ -759,12 +777,13 @@ impl<'tcx> Lower<'tcx> for rustc_ty::Const<'tcx> {
                 ConstKind::Param(ParamConst { name: param_const.name, index: param_const.index })
             }
             rustc_type_ir::ConstKind::Value(value) => {
-                ConstKind::Value(value.ty.lower(tcx)?, value.valtree.lower(tcx))
+                ConstKind::Value(value.ty.lower(tcx)?, value.valtree.lower(tcx)?)
             }
-            rustc_type_ir::ConstKind::Unevaluated(c) => {
+            rustc_type_ir::ConstKind::Alias(_, c) => {
                 // TODO: raise unsupported if c.args is not empty?
                 let args = c.args.lower(tcx)?;
-                ConstKind::Unevaluated(UnevaluatedConst { def: c.def, args, promoted: None })
+                let kind = c.kind.lower(tcx)?;
+                ConstKind::Alias(AliasConst { kind, args, promoted: None })
             }
             _ => return Err(UnsupportedReason::new(format!("unsupported const {self:?}"))),
         };
@@ -802,7 +821,10 @@ impl<'tcx> Lower<'tcx> for rustc_ty::Ty<'tcx> {
                 Ok(Ty::mk_adt(adt_def.lower(tcx), args))
             }
             rustc_ty::FnDef(def_id, args) => {
-                let args = args.lower(tcx)?;
+                let args = args
+                    .no_bound_vars()
+                    .ok_or_else(|| UnsupportedReason::new("late-bound args in `FnDef`"))?
+                    .lower(tcx)?;
                 Ok(Ty::mk_fn_def(*def_id, args))
             }
             rustc_ty::Never => Ok(Ty::mk_never()),
@@ -827,10 +849,10 @@ impl<'tcx> Lower<'tcx> for rustc_ty::Ty<'tcx> {
                 Ok(Ty::mk_closure(*did, args))
             }
 
-            rustc_ty::Alias(kind, alias_ty) => {
-                let kind = kind.lower(tcx)?;
+            rustc_ty::Alias(_, alias_ty) => {
+                let kind = alias_ty.kind.lower(tcx)?;
                 let args = alias_ty.args.lower(tcx)?;
-                Ok(Ty::mk_alias(kind, alias_ty.def_id, args))
+                Ok(Ty::mk_alias(kind, args))
             }
             rustc_ty::Coroutine(did, args) => {
                 let args = args.lower(tcx)?;
@@ -853,6 +875,7 @@ impl<'tcx> Lower<'tcx> for rustc_ty::Ty<'tcx> {
                 Ok(Ty::mk_dynamic(exi_preds, region))
             }
             rustc_ty::Foreign(def_id) => Ok(Ty::mk_foreign(*def_id)),
+            rustc_ty::Pat(..) => Ok(Ty::mk_pat()),
             _ => Err(UnsupportedReason::new(format!("unsupported type `{self:?}`"))),
         }
     }
@@ -865,20 +888,63 @@ fn fnptr_as_fnsig<'tcx>(
     fn_sig_tys.map_bound(|fn_sig_tys| {
         rustc_ty::FnSig {
             inputs_and_output: fn_sig_tys.inputs_and_output,
-            c_variadic: header.c_variadic,
-            safety: header.safety,
-            abi: header.abi,
+            fn_sig_kind: header.fn_sig_kind,
         }
     })
 }
 
-impl<'tcx> Lower<'tcx> for rustc_ty::AliasTyKind {
+impl<'tcx> Lower<'tcx> for rustc_ty::AliasTerm<'tcx> {
+    type R = Result<AliasTerm, UnsupportedReason>;
+
+    fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
+        Ok(AliasTerm { kind: self.kind.lower(tcx)?, args: self.args.lower(tcx)? })
+    }
+}
+
+impl<'tcx> Lower<'tcx> for rustc_ty::AliasConstKind<'tcx> {
+    type R = Result<AliasConstKind, UnsupportedReason>;
+
+    fn lower(self, _tcx: TyCtxt<'tcx>) -> Self::R {
+        Ok(match self {
+            rustc_ty::AliasConstKind::Projection { def_id } => {
+                AliasConstKind::Projection { def_id }
+            }
+            rustc_ty::AliasConstKind::InherentSelf { def_id } => {
+                AliasConstKind::InherentSelf { def_id }
+            }
+            rustc_ty::AliasConstKind::InherentImpl { def_id } => {
+                AliasConstKind::InherentImpl { def_id }
+            }
+            rustc_ty::AliasConstKind::Free { def_id } => AliasConstKind::Free { def_id },
+            rustc_ty::AliasConstKind::Anon { def_id } => AliasConstKind::Anon { def_id },
+        })
+    }
+}
+
+impl<'tcx> Lower<'tcx> for rustc_ty::AliasTermKind<'tcx> {
+    type R = Result<AliasTermKind, UnsupportedReason>;
+
+    fn lower(self, _tcx: TyCtxt<'tcx>) -> Self::R {
+        match self {
+            rustc_ty::AliasTermKind::ProjectionTy { def_id } => {
+                Ok(AliasTermKind::ProjectionTy { def_id })
+            }
+            rustc_ty::AliasTermKind::OpaqueTy { def_id } => Ok(AliasTermKind::OpaqueTy { def_id }),
+            rustc_ty::AliasTermKind::FreeTy { def_id } => Ok(AliasTermKind::FreeTy { def_id }),
+            _ => Err(UnsupportedReason::new(format!("unsupported alias term kind `{self:?}`"))),
+        }
+    }
+}
+
+impl<'tcx> Lower<'tcx> for rustc_ty::AliasTyKind<'tcx> {
     type R = Result<AliasKind, UnsupportedReason>;
 
     fn lower(self, _tcx: TyCtxt<'tcx>) -> Self::R {
         match self {
-            rustc_type_ir::AliasTyKind::Projection => Ok(AliasKind::Projection),
-            rustc_type_ir::AliasTyKind::Opaque => Ok(AliasKind::Opaque),
+            rustc_type_ir::AliasTyKind::Projection { def_id } => {
+                Ok(AliasKind::Projection { def_id })
+            }
+            rustc_type_ir::AliasTyKind::Opaque { def_id } => Ok(AliasKind::Opaque { def_id }),
             _ => Err(UnsupportedReason::new(format!("unsupported alias kind `{self:?}`"))),
         }
     }
@@ -962,14 +1028,14 @@ impl<'tcx> Lower<'tcx> for rustc_middle::ty::GenericArg<'tcx> {
 impl<'tcx> Lower<'tcx> for rustc_middle::ty::Region<'tcx> {
     type R = Result<Region, UnsupportedReason>;
 
-    fn lower(self, _tcx: TyCtxt<'tcx>) -> Self::R {
+    fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
         use rustc_middle::ty;
         match self.kind() {
             ty::ReVar(rvid) => Ok(Region::ReVar(rvid)),
             ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), bregion) => {
                 Ok(Region::ReBound(
                     debruijn,
-                    Ok(BoundRegion { kind: bregion.kind, var: bregion.var })?,
+                    Ok(BoundRegion { kind: bregion.kind.lower(tcx), var: bregion.var })?,
                 ))
             }
             ty::ReEarlyParam(bregion) => Ok(Region::ReEarlyParam(bregion)),
@@ -1016,12 +1082,12 @@ impl<'tcx> Lower<'tcx> for &rustc_middle::ty::GenericParamDef {
     }
 }
 
-impl<'tcx> Lower<'tcx> for rustc_ty::GenericPredicates<'tcx> {
+impl<'tcx> Lower<'tcx> for rustc_ty::GenericClauses<'tcx> {
     type R = Result<GenericPredicates, UnsupportedErr>;
 
     fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
         let predicates = self
-            .predicates
+            .clauses
             .iter()
             .map(|(clause, span)| {
                 clause
@@ -1057,12 +1123,9 @@ impl<'tcx> Lower<'tcx> for rustc_ty::ClauseKind<'tcx> {
                         "unsupported projection predicate `{proj_pred:?}`"
                     )));
                 };
-                let proj_ty = proj_pred.projection_term;
-                let args = proj_ty.args.lower(tcx)?;
-
-                let projection_ty = AliasTy { args, def_id: proj_ty.def_id };
+                let projection_term = proj_pred.projection_term.lower(tcx)?;
                 let term = term.lower(tcx)?;
-                ClauseKind::Projection(ProjectionPredicate { projection_ty, term })
+                ClauseKind::Projection(ProjectionPredicate { projection_term, term })
             }
             rustc_ty::ClauseKind::RegionOutlives(outlives) => {
                 ClauseKind::RegionOutlives(outlives.lower(tcx)?)
@@ -1073,6 +1136,7 @@ impl<'tcx> Lower<'tcx> for rustc_ty::ClauseKind<'tcx> {
             rustc_ty::ClauseKind::ConstArgHasType(const_, ty) => {
                 ClauseKind::ConstArgHasType(const_.lower(tcx)?, ty.lower(tcx)?)
             }
+            rustc_ty::ClauseKind::UnstableFeature(sym) => ClauseKind::UnstableFeature(sym),
             _ => {
                 return Err(UnsupportedReason::new(format!("unsupported clause kind `{self:?}`")));
             }
@@ -1097,7 +1161,7 @@ impl<'tcx> Lower<'tcx> for rustc_ty::TraitRef<'tcx> {
     }
 }
 
-impl<'tcx> Lower<'tcx> for rustc_ty::TypeOutlivesPredicate<'tcx> {
+impl<'tcx> Lower<'tcx> for rustc_ty::TypeOutlivesClause<'tcx> {
     type R = Result<TypeOutlivesPredicate, UnsupportedReason>;
 
     fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
@@ -1105,7 +1169,7 @@ impl<'tcx> Lower<'tcx> for rustc_ty::TypeOutlivesPredicate<'tcx> {
     }
 }
 
-impl<'tcx> Lower<'tcx> for rustc_ty::RegionOutlivesPredicate<'tcx> {
+impl<'tcx> Lower<'tcx> for rustc_ty::RegionOutlivesClause<'tcx> {
     type R = Result<RegionOutlivesPredicate, UnsupportedReason>;
 
     fn lower(self, tcx: TyCtxt<'tcx>) -> Self::R {
@@ -1124,10 +1188,10 @@ mod errors {
     use super::UnsupportedReason;
 
     #[derive(Diagnostic)]
-    #[diag(rustc_bridge_unsupported_local_decl, code = E0999)]
+    #[diag("unsupported local declaration", code = E0999)]
     pub(super) struct UnsupportedLocalDecl<'tcx> {
         #[primary_span]
-        #[label]
+        #[label("this declaration has type `{$ty}` which is not currently supported")]
         span: Span,
         ty: rustc_middle::ty::Ty<'tcx>,
     }
@@ -1142,8 +1206,8 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(rustc_bridge_unsupported_mir, code = E0999)]
-    #[note]
+    #[diag("unsupported {$kind}", code = E0999)]
+    #[note("{$reason}")]
     pub(super) struct UnsupportedMir {
         #[primary_span]
         span: Span,

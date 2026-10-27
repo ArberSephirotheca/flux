@@ -1,4 +1,8 @@
-use std::{fs::File, path::Path};
+use std::{
+    fs::{self, File},
+    io::BufWriter,
+    path::Path,
+};
 
 use flux_config as config;
 use rustc_hash::FxHashMap;
@@ -34,6 +38,18 @@ impl<R> QueryCache<R> {
         if val.constr_hash == constr_hash { Some(&val.result) } else { None }
     }
 
+    /// Look up a result by key only (no hash validation).
+    pub fn lookup_by_key(&self, key: &str) -> Option<&R> {
+        self.entries.get(key).map(|e| &e.result)
+    }
+
+    /// Mutate a cached result by key only (no hash validation).
+    pub fn update_result_by_key(&mut self, key: &str, f: impl FnOnce(&mut R)) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            f(&mut entry.result);
+        }
+    }
+
     fn path() -> Result<&'static Path, std::io::Error> {
         if let Some(path) = config::cache_path()
             && let Some(parent) = path.parent()
@@ -53,17 +69,17 @@ impl<R> QueryCache<R> {
 impl<R: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned> QueryCache<R> {
     pub fn save(&self) -> Result<(), std::io::Error> {
         let path = Self::path()?;
-        let mut file = File::create(path).unwrap();
-        serde_json::to_writer(&mut file, &self.entries).unwrap();
+        let file = File::create(path).unwrap();
+        serde_json::to_writer(BufWriter::new(file), &self.entries).unwrap();
         Ok(())
     }
 
     pub fn load() -> Self {
         let path = Self::path();
         if let Ok(path) = path
-            && let Ok(file) = File::open(path)
+            && let Ok(data) = fs::read(path)
         {
-            let entries = serde_json::from_reader(file);
+            let entries = serde_json::from_slice(&data);
             if let Ok(entries) = entries {
                 return QueryCache { entries };
             }

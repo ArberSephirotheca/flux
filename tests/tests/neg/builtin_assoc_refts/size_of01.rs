@@ -1,13 +1,18 @@
-// Test spec on `core::mem::size_of`
+// An invariant on a struct referring to an associated refinement on the same struct.
+// See https://github.com/flux-rs/flux/issues/1797
 
-extern crate flux_core;
-
-struct S {
-    x: i32,
-    y: i32,
+#[flux::refined_by(n: int)]
+#[flux::invariant(n >= <Foo as Sized>::size_of())]
+pub struct Foo {
+    #[flux::field(usize[n])]
+    value: usize,
 }
 
-fn test() {
-    flux_rs::assert(size_of::<i32>() == 2); //~ ERROR refinement type
-    flux_rs::assert(size_of::<S>() == 4); //~ ERROR refinement type
+pub fn make() -> Foo {
+    Foo { value: 4 } //~ ERROR refinement type
+}
+
+#[flux::sig(fn(Foo) -> usize{v: v >= 9})]
+pub fn get(foo: Foo) -> usize {
+    foo.value //~ ERROR refinement type
 }

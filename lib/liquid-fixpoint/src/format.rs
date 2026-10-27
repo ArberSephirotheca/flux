@@ -1,67 +1,96 @@
 use std::{
     fmt::{self, Write},
     iter,
+    str::FromStr,
 };
 
 use itertools::Itertools;
 
 use crate::{
-    BinOp, BinRel, ConstDecl, Constant, Constraint, DataCtor, DataDecl, DataField, Expr,
-    FixpointFmt, FunDef, FunSort, Identifier, KVarDecl, Pred, Qualifier, Sort, SortCtor, Task,
-    Types,
+    Axiom, BinOp, BinRel, ConstDecl, Constant, Constraint, DataCtor, DataDecl, DataField, Expr,
+    FixpointFmt, FunDef, FunSort, Identifier, KVarDecl, Qualifier, Sort, SortCtor, Task, Types,
+    constraint::{Pred, Quantifier, WKVar},
 };
 
 pub(crate) fn fmt_constraint<T: Types>(
     cstr: &Constraint<T>,
     f: &mut fmt::Formatter<'_>,
+    pretty: bool,
 ) -> fmt::Result {
-    let mut cx = ConstraintFormatter::default();
+    let mut cx = ConstraintFormatter::new(pretty);
     write!(f, "(constraint")?;
     cx.incr();
     cx.newline(f)?;
     cx.fmt_constraint(f, cstr)?;
     cx.decr();
-    writeln!(f, ")")
+    if pretty { writeln!(f, ")") } else { write!(f, ")") }
 }
 
 impl<T: Types> fmt::Display for Constraint<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_constraint(self, f)
+        fmt_constraint(self, f, true)
     }
+}
+
+pub(crate) fn fmt_task<T: Types>(
+    task: &Task<T>,
+    f: &mut fmt::Formatter<'_>,
+    pretty: bool,
+) -> fmt::Result {
+    if task.scrape_quals {
+        writeln!(f, "(fixpoint \"--scrape=both\")")?;
+    }
+    if pretty {
+        for line in &task.comments {
+            writeln!(f, ";; {line}")?;
+        }
+        writeln!(f)?;
+    }
+
+    for data_decl in &task.data_decls {
+        writeln!(f, "{data_decl}")?;
+    }
+
+    for qualif in &task.qualifiers {
+        writeln!(f, "{qualif}")?;
+    }
+
+    for cinfo in &task.constants {
+        writeln!(f, "{cinfo}")?;
+    }
+
+    for fun_decl in &task.define_funs {
+        writeln!(f, "{fun_decl}")?;
+    }
+
+    // Axioms go after the constants and functions they talk about.
+    for axiom in &task.axioms {
+        writeln!(f, "{axiom}")?;
+    }
+
+    for kvar in &task.kvars {
+        writeln!(f, "{kvar}")?;
+    }
+
+    if pretty {
+        writeln!(f)?;
+    }
+    fmt_constraint(&task.constraint, f, pretty)
 }
 
 impl<T: Types> fmt::Display for Task<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.scrape_quals {
-            writeln!(f, "(fixpoint \"--scrape=both\")")?;
-        }
-        for line in &self.comments {
-            writeln!(f, ";; {line}")?;
-        }
-        writeln!(f)?;
+        fmt_task(self, f, true)
+    }
+}
 
-        for data_decl in &self.data_decls {
-            writeln!(f, "{data_decl}")?;
-        }
+#[cfg(not(feature = "rust-fixpoint"))]
+pub(crate) struct CompactTask<'a, T: Types>(pub &'a Task<T>);
 
-        for qualif in &self.qualifiers {
-            writeln!(f, "{qualif}")?;
-        }
-
-        for cinfo in &self.constants {
-            writeln!(f, "{cinfo}")?;
-        }
-
-        for fun_decl in &self.define_funs {
-            writeln!(f, "{fun_decl}")?;
-        }
-
-        for kvar in &self.kvars {
-            writeln!(f, "{kvar}")?;
-        }
-
-        writeln!(f)?;
-        fmt_constraint(&self.constraint, f)
+#[cfg(not(feature = "rust-fixpoint"))]
+impl<T: Types> fmt::Display for CompactTask<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_task(self.0, f, false)
     }
 }
 
@@ -69,10 +98,10 @@ impl<T: Types> fmt::Display for KVarDecl<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "(var ${} ({})) ;; {}",
+            "(var ${} ({}) :self {})",
             self.kvid.display(),
             self.sorts.iter().format(" "),
-            self.comment
+            self.self_args,
         )
     }
 }
@@ -93,19 +122,28 @@ impl<T: Types> fmt::Debug for Task<T> {
     }
 }
 
-#[derive(Default)]
 struct ConstraintFormatter {
     level: u32,
+    pretty: bool,
 }
 
 impl ConstraintFormatter {
+    fn new(pretty: bool) -> Self {
+        Self { level: 0, pretty }
+    }
     fn fmt_constraint<T: Types>(
         &mut self,
         f: &mut fmt::Formatter<'_>,
         cstr: &Constraint<T>,
     ) -> fmt::Result {
         match cstr {
-            Constraint::Pred(pred, tag) => self.fmt_pred_in_head_position(pred, tag.as_ref(), f),
+            Constraint::Pred(head, tag) => {
+                if let Some(tag) = tag {
+                    write!(f, "(tag {head} \"{tag}\")")
+                } else {
+                    write!(f, "{head}")
+                }
+            }
             Constraint::Conj(cstrs) => {
                 match &cstrs[..] {
                     [] => write!(f, "((true))"),
@@ -123,47 +161,39 @@ impl ConstraintFormatter {
                 }
             }
             Constraint::ForAll(bind, head) => {
-                write!(f, "(forall (({} {}) {})", bind.name.display(), bind.sort, bind.pred)?;
-
+                write!(f, "(forall (({} {}) ", bind.name.display(), bind.sort,)?;
+                self.fmt_preds_in_assumption_position(&bind.preds, f)?;
+                write!(f, ")")?;
                 self.incr();
                 self.newline(f)?;
                 self.fmt_constraint(f, head)?;
                 self.decr();
-
                 f.write_str(")")
             }
         }
     }
 
-    fn fmt_pred_in_head_position<T: Types>(
+    fn fmt_preds_in_assumption_position<T: Types>(
         &mut self,
-        pred: &Pred<T>,
-        tag: Option<&T::Tag>,
+        preds: &[Pred<T>],
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        match pred {
-            Pred::And(preds) => {
-                match &preds[..] {
-                    [] => write!(f, "((true))"),
-                    [pred] => self.fmt_pred_in_head_position(pred, tag, f),
-                    _ => {
-                        write!(f, "(and")?;
-                        for pred in preds {
-                            self.incr();
-                            self.newline(f)?;
-                            self.fmt_pred_in_head_position(pred, tag, f)?;
-                            self.decr();
-                        }
-                        write!(f, ")")
+        match preds {
+            [] => write!(f, "((true))"),
+            _ => {
+                if preds.len() > 1 {
+                    write!(f, "(and")?;
+                }
+                for (i, pred) in preds.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
                     }
+                    write!(f, "{pred}")?;
                 }
-            }
-            Pred::Expr(_) | Pred::KVar(..) => {
-                if let Some(tag) = tag {
-                    write!(f, "(tag {pred} \"{tag}\")")
-                } else {
-                    write!(f, "{pred}")
+                if preds.len() > 1 {
+                    write!(f, ")")?;
                 }
+                Ok(())
             }
         }
     }
@@ -177,13 +207,19 @@ impl ConstraintFormatter {
     }
 
     fn newline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_char('\n')?;
-        self.padding(f)
+        if self.pretty {
+            f.write_char('\n')?;
+            self.padding(f)
+        } else {
+            f.write_char(' ')
+        }
     }
 
     fn padding(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for _ in 0..self.level {
-            f.write_str(" ")?;
+        if self.pretty {
+            for _ in 0..self.level {
+                f.write_str(" ")?;
+            }
         }
         Ok(())
     }
@@ -263,17 +299,19 @@ fn fmt_func<T: Types>(params: usize, sort: &Sort<T>, f: &mut fmt::Formatter<'_>)
 impl<T: Types> fmt::Display for Pred<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Pred::And(preds) => {
-                match &preds[..] {
-                    [] => write!(f, "((true))"),
-                    [pred] => write!(f, "{pred}"),
-                    preds => write!(f, "(and {})", preds.iter().join(" ")),
-                }
-            }
             Pred::KVar(kvid, args) => {
                 write!(f, "(${} {})", kvid.display(), args.iter().join(" "),)
             }
             Pred::Expr(expr) => write!(f, "({expr})"),
+        }
+    }
+}
+
+impl fmt::Display for Quantifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Quantifier::Exists => write!(f, "exists"),
+            Quantifier::Forall => write!(f, "forall"),
         }
     }
 }
@@ -283,7 +321,7 @@ impl<T: Types> fmt::Display for Expr<T> {
         match self {
             Expr::Constant(c) => write!(f, "{c}"),
             Expr::Var(x) => write!(f, "{}", x.display()),
-            Expr::App(func, _sort_args, args) => {
+            Expr::App(func, _sort_args, args, _out_sort) => {
                 write!(f, "({func} {})", args.iter().format(" "))
             }
             Expr::Neg(e) => {
@@ -328,13 +366,19 @@ impl<T: Types> fmt::Display for Expr<T> {
             Expr::IsCtor(ctor, e) => {
                 write!(f, "(is${} {})", ctor.display(), e)
             }
-            Expr::Exists(sorts, body) => {
+            Expr::Quantifier(q, sorts, body) => {
                 write!(
                     f,
-                    "(exists ({}) {})",
-                    sorts.iter().map(|binder| &binder.1).format(" "),
+                    "({} ({}) {})",
+                    q,
+                    sorts.iter().format_with(" ", |(name, sort), f| {
+                        f(&format_args!("({} {sort})", name.display()))
+                    }),
                     body
                 )
+            }
+            Expr::WKVar(WKVar { wkvid, args }) => {
+                write!(f, "({} {})", wkvid.display(), args.iter().format(" "))
             }
         }
     }
@@ -344,7 +388,7 @@ impl<T: Types> fmt::Display for Constant<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Constant::Numeral(n) => write!(f, "{n}"),
-            Constant::Real(n) => write!(f, "{n}.0"),
+            Constant::Real(n) => write!(f, "{}", n.display()),
             Constant::Boolean(b) => write!(f, "{b}"),
             Constant::String(s) => write!(f, "{}", s.display()),
             Constant::BitVec(i, sz) => {
@@ -364,11 +408,35 @@ impl<T: Types> fmt::Display for Qualifier<T> {
             f,
             "(qualif {} ({}) ({}))",
             self.name,
-            self.args.iter().format_with(" ", |(name, sort), f| {
-                f(&format_args!("({} {sort})", name.display()))
+            self.args.iter().format_with(" ", |param, f| {
+                // The `#` is signature syntax, not part of the variable's name.
+                let wildcard = if param.is_wildcard { "#" } else { "" };
+                f(&format_args!("({}{wildcard} {})", param.name.display(), param.sort))
             }),
             self.body
         )
+    }
+}
+
+impl<T: Types> fmt::Display for Axiom<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.args.is_empty() {
+            return write!(f, "(axiom {})", self.body);
+        }
+        let args = self
+            .args
+            .iter()
+            .format_with(" ", |(name, sort), f| f(&format_args!("({} {sort})", name.display())));
+        if self.patterns.is_empty() {
+            write!(f, "(axiom (forall ({args}) {}))", self.body)
+        } else {
+            write!(
+                f,
+                "(axiom (forall ({args}) (! {} :pattern ({}))))",
+                self.body,
+                self.patterns.iter().format(" ")
+            )
+        }
     }
 }
 
@@ -413,6 +481,20 @@ impl fmt::Display for BinOp {
     }
 }
 
+impl FromStr for BinOp {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "+" => Ok(BinOp::Add),
+            "-" => Ok(BinOp::Sub),
+            "*" => Ok(BinOp::Mul),
+            "/" | "div" => Ok(BinOp::Div),
+            "mod" => Ok(BinOp::Mod),
+            _ => Err(format!("Unexpected BinOp {}", s)),
+        }
+    }
+}
+
 impl fmt::Display for BinRel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -422,6 +504,21 @@ impl fmt::Display for BinRel {
             BinRel::Ge => write!(f, ">="),
             BinRel::Lt => write!(f, "<"),
             BinRel::Le => write!(f, "<="),
+        }
+    }
+}
+
+impl FromStr for BinRel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "=" => Ok(BinRel::Eq),
+            "!=" => Ok(BinRel::Ne),
+            ">" => Ok(BinRel::Gt),
+            ">=" => Ok(BinRel::Ge),
+            "<" => Ok(BinRel::Lt),
+            "<=" => Ok(BinRel::Le),
+            _ => Err(format!("Unexpected BinRel {}", s)),
         }
     }
 }

@@ -2,12 +2,12 @@ use super::{
     AliasReft, AssocItemConstraint, AssocItemConstraintKind, BaseTy, BaseTyKind, Ensures, EnumDef,
     Expr, ExprKind, FieldDef, FieldExpr, FluxItem, FnDecl, FnOutput, FnSig, ForeignItem,
     ForeignItemKind, FuncSort, GenericArg, GenericBound, Generics, Impl, ImplAssocReft, ImplItem,
-    ImplItemKind, Item, ItemKind, Lifetime, Lit, OpaqueTy, OwnerNode, Path, PathExpr, PathSegment,
+    ImplItemKind, Item, ItemKind, Lit, OpaqueTy, OwnerNode, Path, PathExpr, PathSegment,
     PolyFuncSort, PolyTraitRef, QPath, Qualifier, RefineParam, Requires, Sort, SortPath, SpecFunc,
     StructDef, TraitAssocReft, TraitItem, TraitItemKind, Ty, TyAlias, TyKind, VariantDef,
     VariantRet, WhereBoundPredicate,
 };
-use crate::fhir::{PrimOpProp, QPathExpr, SortDecl, StructKind};
+use crate::fhir::{Axiom, PrimOpProp, QPathExpr, QuantDom, SortDecl, StructKind};
 
 #[macro_export]
 macro_rules! walk_list {
@@ -40,6 +40,10 @@ pub trait Visitor<'v>: Sized {
 
     fn visit_primop_prop(&mut self, prop: &PrimOpProp<'v>) {
         walk_primop_prop(self, prop);
+    }
+
+    fn visit_axiom(&mut self, axiom: &Axiom<'v>) {
+        walk_axiom(self, axiom);
     }
 
     fn visit_node(&mut self, node: &OwnerNode<'v>) {
@@ -146,8 +150,6 @@ pub trait Visitor<'v>: Sized {
         walk_generic_arg(self, arg);
     }
 
-    fn visit_lifetime(&mut self, _lft: &Lifetime) {}
-
     fn visit_ty(&mut self, ty: &Ty<'v>) {
         walk_ty(self, ty);
     }
@@ -188,6 +190,10 @@ pub trait Visitor<'v>: Sized {
         walk_func_sort(self, func);
     }
 
+    fn visit_domain(&mut self, dom: &QuantDom) {
+        walk_domain(self, dom);
+    }
+
     fn visit_expr(&mut self, expr: &Expr<'v>) {
         walk_expr(self, expr);
     }
@@ -220,6 +226,11 @@ fn walk_primop_prop<'v, V: Visitor<'v>>(vis: &mut V, prop: &PrimOpProp<'v>) {
     vis.visit_expr(&prop.body);
 }
 
+fn walk_axiom<'v, V: Visitor<'v>>(vis: &mut V, axiom: &Axiom<'v>) {
+    walk_list!(vis, visit_refine_param, axiom.args);
+    vis.visit_expr(&axiom.body);
+}
+
 fn walk_qualifier<'v, V: Visitor<'v>>(vis: &mut V, qualifier: &Qualifier<'v>) {
     walk_list!(vis, visit_refine_param, qualifier.args);
     vis.visit_expr(&qualifier.expr);
@@ -235,6 +246,9 @@ fn walk_flux_item<'v, V: Visitor<'v>>(vis: &mut V, item: &FluxItem<'v>) {
         }
         FluxItem::PrimOpProp(prop) => {
             vis.visit_primop_prop(prop);
+        }
+        FluxItem::Axiom(axiom) => {
+            vis.visit_axiom(axiom);
         }
         FluxItem::SortDecl(sort_decl) => {
             vis.visit_sort_decl(sort_decl);
@@ -290,7 +304,7 @@ pub fn walk_opaque_ty<'v, V: Visitor<'v>>(vis: &mut V, opaque_ty: &OpaqueTy<'v>)
 pub fn walk_generic_bound<'v, V: Visitor<'v>>(vis: &mut V, bound: &GenericBound<'v>) {
     match bound {
         GenericBound::Trait(trait_ref) => vis.visit_poly_trait_ref(trait_ref),
-        GenericBound::Outlives(_) => {}
+        GenericBound::Outlives => {}
     }
 }
 
@@ -324,6 +338,11 @@ pub fn walk_item<'v, V: Visitor<'v>>(vis: &mut V, item: &Item<'v>) {
                 vis.visit_expr(expr);
             }
         }
+        ItemKind::Static(ty) => {
+            if let Some(ty) = ty {
+                vis.visit_ty(ty);
+            }
+        }
     }
 }
 
@@ -350,6 +369,10 @@ pub fn walk_foreign_item<'v, V: Visitor<'v>>(vis: &mut V, impl_item: &ForeignIte
         ForeignItemKind::Fn(fn_sig, generics) => {
             vis.visit_generics(generics);
             vis.visit_fn_sig(fn_sig);
+        }
+        ForeignItemKind::Static(ty, _, _, generics) => {
+            vis.visit_generics(generics);
+            vis.visit_ty(ty);
         }
     }
 }
@@ -419,7 +442,6 @@ pub fn walk_fn_output<'v, V: Visitor<'v>>(vis: &mut V, output: &FnOutput<'v>) {
 
 pub fn walk_generic_arg<'v, V: Visitor<'v>>(vis: &mut V, arg: &GenericArg<'v>) {
     match arg {
-        GenericArg::Lifetime(lft) => vis.visit_lifetime(lft),
         GenericArg::Type(ty) => vis.visit_ty(ty),
         GenericArg::Const(_) | GenericArg::Infer => {}
     }
@@ -440,31 +462,28 @@ pub fn walk_ty<'v, V: Visitor<'v>>(vis: &mut V, ty: &Ty<'v>) {
             vis.visit_expr(&pred);
             vis.visit_ty(ty);
         }
-        TyKind::StrgRef(lft, loc, ty) => {
-            vis.visit_lifetime(&lft);
+        TyKind::StrgRef(loc, ty) => {
             vis.visit_path_expr(loc);
             vis.visit_ty(ty);
         }
-        TyKind::Ref(lft, mty) => {
-            vis.visit_lifetime(&lft);
-            vis.visit_ty(mty.ty);
+        TyKind::Ref(ty, _) => {
+            vis.visit_ty(ty);
         }
-        TyKind::BareFn(bare_fn) => vis.visit_fn_decl(bare_fn.decl),
+        TyKind::BareFn(bare_fn) => {
+            walk_list!(vis, visit_refine_param, bare_fn.params);
+            vis.visit_fn_decl(bare_fn.decl);
+        }
         TyKind::Tuple(tys) => {
             walk_list!(vis, visit_ty, tys);
         }
         TyKind::Array(ty, _len) => {
             vis.visit_ty(ty);
         }
-        TyKind::RawPtr(ty, _mtblt) => {
-            vis.visit_ty(ty);
-        }
         TyKind::OpaqueDef(opaque_ty) => {
             vis.visit_opaque_ty(opaque_ty);
         }
-        TyKind::TraitObject(poly_traits, lft, _) => {
+        TyKind::TraitObject(poly_traits, _) => {
             walk_list!(vis, visit_poly_trait_ref, poly_traits);
-            vis.visit_lifetime(&lft);
         }
         TyKind::Never | TyKind::Infer | TyKind::Err(_) => {}
     }
@@ -474,6 +493,9 @@ pub fn walk_bty<'v, V: Visitor<'v>>(vis: &mut V, bty: &BaseTy<'v>) {
     match &bty.kind {
         BaseTyKind::Path(path) => vis.visit_qpath(path),
         BaseTyKind::Slice(ty) => vis.visit_ty(ty),
+        BaseTyKind::RawPtr(ty, _mtblt) => {
+            vis.visit_ty(ty);
+        }
         BaseTyKind::Err(_) => {}
     }
 }
@@ -519,6 +541,9 @@ pub fn walk_sort<'v, V: Visitor<'v>>(vis: &mut V, sort: &Sort<'v>) {
         Sort::Path(path) => vis.visit_sort_path(path),
         Sort::Func(func) => vis.visit_poly_func_sort(func),
         Sort::SortOf(bty) => vis.visit_bty(bty),
+        Sort::Tuple(sorts) => {
+            walk_list!(vis, visit_sort, *sorts);
+        }
         Sort::Loc | Sort::BitVec(_) | Sort::Infer | Sort::Err(_) => {}
     }
 }
@@ -552,6 +577,16 @@ pub fn walk_field_expr<'v, V: Visitor<'v>>(vis: &mut V, expr: &FieldExpr<'v>) {
     vis.visit_expr(&expr.expr);
 }
 
+pub fn walk_domain<'v, V: Visitor<'v>>(vis: &mut V, dom: &QuantDom) {
+    match dom {
+        QuantDom::Bounded { start, end } => {
+            vis.visit_literal(&Lit::Int(*start as u128));
+            vis.visit_literal(&Lit::Int(*end as u128));
+        }
+        QuantDom::Unbounded => {}
+    }
+}
+
 pub fn walk_expr<'v, V: Visitor<'v>>(vis: &mut V, expr: &Expr<'v>) {
     match expr.kind {
         ExprKind::Var(qpath) => walk_qpath_expr(vis, qpath),
@@ -568,7 +603,8 @@ pub fn walk_expr<'v, V: Visitor<'v>>(vis: &mut V, expr: &Expr<'v>) {
             vis.visit_expr(e2);
         }
         ExprKind::UnaryOp(_op, e) => vis.visit_expr(e),
-        ExprKind::App(_func, args) => {
+        ExprKind::App(func, args) => {
+            vis.visit_path_expr(&func);
             walk_list!(vis, visit_expr, args);
         }
         ExprKind::Alias(alias_reft, args) => {
@@ -584,7 +620,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(vis: &mut V, expr: &Expr<'v>) {
             walk_list!(vis, visit_refine_param, refine_params);
             vis.visit_expr(body);
         }
-        ExprKind::Record(exprs) | ExprKind::SetLiteral(exprs) => {
+        ExprKind::Record(exprs) | ExprKind::SetLiteral(exprs) | ExprKind::Tuple(exprs) => {
             walk_list!(vis, visit_expr, exprs);
         }
         ExprKind::Constructor(path, exprs, spread) => {
@@ -596,7 +632,8 @@ pub fn walk_expr<'v, V: Visitor<'v>>(vis: &mut V, expr: &Expr<'v>) {
                 vis.visit_expr(&s.expr);
             }
         }
-        ExprKind::BoundedQuant(_, param, _, expr) => {
+        ExprKind::Quant(_, param, dom, expr) => {
+            vis.visit_domain(&dom);
             vis.visit_refine_param(&param);
             vis.visit_expr(expr);
         }

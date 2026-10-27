@@ -1,10 +1,10 @@
 use std::{cell::RefCell, fmt, iter};
 
 use flux_common::{bug, dbg, tracked_span_assert_eq, tracked_span_bug, tracked_span_dbg_assert_eq};
-use flux_config::{self as config, InferOpts, OverflowMode};
+use flux_config::{self as config, InferOpts, OverflowMode, RawDerefMode};
 use flux_macros::{TypeFoldable, TypeVisitable};
 use flux_middle::{
-    FixpointQueryKind,
+    FixpointQueryKind, PanicSpec,
     def_id::MaybeExternId,
     global_env::GlobalEnv,
     metrics::{self, Metric},
@@ -31,7 +31,11 @@ use rustc_type_ir::Variance::Invariant;
 
 use crate::{
     evars::{EVarState, EVarStore},
-    fixpoint_encoding::{Answer, Backend, FixQueryCache, FixpointCtxt, KVarEncoding, KVarGen},
+    fixpoint_encoding::{
+        Answer, Backend, FixQueryCache, FixpointCtxt, KVarGen, lean_task_key, record_lean_task,
+    },
+    fn_subtyping::{SubFn, check_fn_subtyping},
+    lean_encoding::{hyperlink_proof, log_proof},
     projections::NormalizeExt as _,
     refine_tree::{Cursor, Marker, RefineTree, Scope},
 };
@@ -78,7 +82,7 @@ pub enum ConstrReason {
     Overflow,
     Underflow,
     Subtype(SubtypeReason),
-    NoPanic(DefId),
+    NoPanic(DefId, PanicSpec),
     Other,
 }
 
@@ -93,6 +97,8 @@ pub struct InferCtxtRootBuilder<'a, 'genv, 'tcx> {
     genv: GlobalEnv<'genv, 'tcx>,
     opts: InferOpts,
     params: Vec<(Var, Sort)>,
+    /// Facts about `params` assumed for the whole tree, e.g., `N >= 0` for `const N: usize`
+    assumptions: Vec<Expr>,
     infcx: &'a rustc_infer::infer::InferCtxt<'tcx>,
     dummy_kvars: bool,
 }
@@ -104,7 +110,14 @@ impl<'genv, 'tcx> GlobalEnv<'genv, 'tcx> {
         infcx: &'a rustc_infer::infer::InferCtxt<'tcx>,
         opts: InferOpts,
     ) -> InferCtxtRootBuilder<'a, 'genv, 'tcx> {
-        InferCtxtRootBuilder { genv: self, infcx, params: vec![], opts, dummy_kvars: false }
+        InferCtxtRootBuilder {
+            genv: self,
+            infcx,
+            params: vec![],
+            assumptions: vec![],
+            opts,
+            dummy_kvars: false,
+        }
     }
 }
 
@@ -114,14 +127,33 @@ impl<'genv, 'tcx> InferCtxtRootBuilder<'_, 'genv, 'tcx> {
         self
     }
 
+    /// Adds the const generics of `def_id` to the root scope, assuming the same invariants an
+    /// ordinary value of the param's type gets when unpacked (e.g., `N >= 0` for `const N: usize`).
     pub fn with_const_generics(mut self, def_id: DefId) -> QueryResult<Self> {
-        self.params.extend(
-            self.genv
-                .generics_of(def_id)?
-                .const_params(self.genv)?
-                .into_iter()
-                .map(|(pcst, sort)| (Var::ConstGeneric(pcst), sort)),
-        );
+        let tcx = self.genv.tcx();
+        for (param_const, sort, param_def_id) in
+            self.genv.generics_of(def_id)?.const_params(self.genv)?
+        {
+            // The implementation only supports scalar const generics where there is no need to normalize.
+            let param_ty = tcx
+                .type_of(param_def_id)
+                .instantiate_identity()
+                .skip_normalization();
+            let bty = match param_ty.kind() {
+                rustc_middle::ty::Uint(uint_ty) => Some(BaseTy::Uint(*uint_ty)),
+                rustc_middle::ty::Int(int_ty) => Some(BaseTy::Int(*int_ty)),
+                rustc_middle::ty::Char => Some(BaseTy::Char),
+                _ => None,
+            };
+            if let Some(bty) = bty {
+                let idx = Expr::const_generic(param_const);
+                self.assumptions.extend(
+                    bty.invariants(self.genv, self.opts.check_overflow)
+                        .map(|inv| inv.apply(&idx)),
+                );
+            }
+            self.params.push((Var::ConstGeneric(param_const), sort));
+        }
         Ok(self)
     }
 
@@ -172,7 +204,7 @@ impl<'genv, 'tcx> InferCtxtRootBuilder<'_, 'genv, 'tcx> {
         Ok(InferCtxtRoot {
             genv: self.genv,
             inner: RefCell::new(InferCtxtInner::new(self.dummy_kvars)),
-            refine_tree: RefineTree::new(self.params),
+            refine_tree: RefineTree::new(self.params, self.assumptions),
             opts: self.opts,
         })
     }
@@ -191,17 +223,13 @@ impl<'genv, 'tcx> InferCtxtRoot<'genv, 'tcx> {
             cursor: self.refine_tree.cursor_at_root(),
             inner: &self.inner,
             check_overflow: self.opts.check_overflow,
+            allow_raw_deref: self.opts.allow_raw_deref,
         }
     }
 
-    pub fn fresh_kvar_in_scope(
-        &self,
-        binders: &[BoundVariableKinds],
-        scope: &Scope,
-        encoding: KVarEncoding,
-    ) -> Expr {
+    pub fn fresh_kvar_in_scope(&self, binders: &[BoundVariableKinds], scope: &Scope) -> Expr {
         let inner = &mut *self.inner.borrow_mut();
-        inner.kvars.fresh(binders, scope.iter(), encoding)
+        inner.kvars.fresh(binders, scope.iter())
     }
 
     pub fn execute_lean_query(
@@ -220,12 +248,24 @@ impl<'genv, 'tcx> InferCtxtRoot<'genv, 'tcx> {
             flux_config::SmtSolver::Z3 => liquid_fixpoint::SmtSolver::Z3,
             flux_config::SmtSolver::CVC5 => liquid_fixpoint::SmtSolver::CVC5,
         };
-        let mut fcx = FixpointCtxt::new(self.genv, def_id, kvars, Backend::Lean);
+        let mut fcx = FixpointCtxt::new(self.genv, def_id, kvars, Backend::Lean, self.opts.uif_ops);
         let cstr = refine_tree.to_fixpoint(&mut fcx)?;
-        let task = fcx.create_task(def_id, cstr, self.opts.scrape_quals, solver)?;
-        let result = fcx.run_task(cache, def_id, FixpointQueryKind::Body, &task)?;
+        let (task, _) = fcx.create_task(def_id, cstr, self.opts.scrape_quals, solver)?;
 
-        fcx.generate_lean_files(def_id, task, result.solution, result.non_cut_solution)
+        log_proof(self.genv, def_id)?;
+        // Skip re-generation if task is already cached (same hash → same lean files on disk).
+        let key = lean_task_key(self.genv.tcx(), def_id.resolved_id());
+        let hash = task.hash_with_default();
+        let cached = config::is_cache_enabled() && cache.lookup(&key, hash).is_some();
+        if !cached {
+            fcx.generate_lean_files(def_id, task)?;
+            if config::is_cache_enabled() {
+                record_lean_task(cache, key, hash);
+            }
+        }
+        // After generation, so that the proof file exists the first time around.
+        hyperlink_proof(self.genv, def_id);
+        Ok(())
     }
 
     pub fn execute_fixpoint_query(
@@ -259,7 +299,8 @@ impl<'genv, 'tcx> InferCtxtRoot<'genv, 'tcx> {
             flux_config::SmtSolver::CVC5 => liquid_fixpoint::SmtSolver::CVC5,
         };
 
-        let mut fcx = FixpointCtxt::new(self.genv, def_id, kvars, Backend::Fixpoint);
+        let mut fcx =
+            FixpointCtxt::new(self.genv, def_id, kvars, Backend::Fixpoint, self.opts.uif_ops);
         let cstr = refine_tree.to_fixpoint(&mut fcx)?;
 
         // skip checking trivial constraints
@@ -270,9 +311,10 @@ impl<'genv, 'tcx> InferCtxtRoot<'genv, 'tcx> {
             return Ok(Answer::trivial());
         }
 
-        let task = fcx.create_task(def_id, cstr, self.opts.scrape_quals, backend)?;
+        let (task, suggestion_ctx) =
+            fcx.create_task(def_id, cstr, self.opts.scrape_quals, backend)?;
         let result = fcx.run_task(cache, def_id, kind, &task)?;
-        Ok(fcx.result_to_answer(result))
+        fcx.result_to_answer(result, suggestion_ctx)
     }
 
     pub fn split(self) -> (RefineTree, KVarGen) {
@@ -285,6 +327,7 @@ pub struct InferCtxt<'infcx, 'genv, 'tcx> {
     pub region_infcx: &'infcx rustc_infer::infer::InferCtxt<'tcx>,
     pub def_id: DefId,
     pub check_overflow: OverflowMode,
+    pub allow_raw_deref: flux_config::RawDerefMode,
     cursor: Cursor<'infcx>,
     inner: &'infcx RefCell<InferCtxtInner>,
 }
@@ -327,7 +370,7 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
             InferMode::KVar => {
                 let fsort = sort.expect_func().expect_mono();
                 let vars = fsort.inputs().iter().cloned().map_into().collect();
-                let kvar = self.fresh_kvar(&[vars], KVarEncoding::Single);
+                let kvar = self.fresh_kvar(&[vars]);
                 Expr::abs(Lambda::bind_with_fsort(kvar, fsort))
             }
             InferMode::EVar => self.fresh_evar(),
@@ -340,7 +383,7 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
         kind: HoleKind,
     ) -> Expr {
         match kind {
-            HoleKind::Pred => self.fresh_kvar(binders, KVarEncoding::Conj),
+            HoleKind::Pred => self.fresh_kvar(binders),
             HoleKind::Expr(_) => {
                 // We only use expression holes to infer early param arguments for opaque types
                 // at function calls. These should be well-scoped in the current scope, so we ignore
@@ -351,20 +394,15 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
     }
 
     /// Generate a fresh kvar in the _given_ [`Scope`] (similar method in [`InferCtxtRoot`]).
-    pub fn fresh_kvar_in_scope(
-        &self,
-        binders: &[BoundVariableKinds],
-        scope: &Scope,
-        encoding: KVarEncoding,
-    ) -> Expr {
+    pub fn fresh_kvar_in_scope(&self, binders: &[BoundVariableKinds], scope: &Scope) -> Expr {
         let inner = &mut *self.inner.borrow_mut();
-        inner.kvars.fresh(binders, scope.iter(), encoding)
+        inner.kvars.fresh(binders, scope.iter())
     }
 
     /// Generate a fresh kvar in the current scope. See [`KVarGen::fresh`].
-    pub fn fresh_kvar(&self, binders: &[BoundVariableKinds], encoding: KVarEncoding) -> Expr {
+    pub fn fresh_kvar(&self, binders: &[BoundVariableKinds]) -> Expr {
         let inner = &mut *self.inner.borrow_mut();
-        inner.kvars.fresh(binders, self.cursor.vars(), encoding)
+        inner.kvars.fresh(binders, self.cursor.vars())
     }
 
     fn fresh_evar(&self) -> Expr {
@@ -388,16 +426,15 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
     fn enter_exists<T, U>(
         &mut self,
         t: &Binder<T>,
-        f: impl FnOnce(&mut InferCtxt<'_, 'genv, 'tcx>, T) -> U,
-    ) -> U
+        f: impl FnOnce(&mut InferCtxt<'_, 'genv, 'tcx>, T) -> InferResult<U>,
+    ) -> InferResult<U>
     where
         T: TypeFoldable,
     {
         self.ensure_resolved_evars(|infcx| {
             let t = t.replace_bound_refts_with(|sort, mode, _| infcx.fresh_infer_var(sort, mode));
-            Ok(f(infcx, t))
+            f(infcx, t)
         })
-        .unwrap()
     }
 
     /// Used in conjunction with [`InferCtxt::pop_evar_scope`] to ensure evars are solved at the end
@@ -439,6 +476,10 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
 
     pub fn cursor(&self) -> &Cursor<'infcx> {
         &self.cursor
+    }
+
+    pub fn allow_raw_deref(&self) -> bool {
+        matches!(self.allow_raw_deref, RawDerefMode::Ok)
     }
 }
 
@@ -515,7 +556,7 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
 
     pub fn assume_invariants(&mut self, ty: &Ty) {
         self.cursor
-            .assume_invariants(self.genv.tcx(), ty, self.check_overflow);
+            .assume_invariants(self.genv, ty, self.check_overflow);
     }
 
     fn check_impl(&mut self, pred1: impl Into<Expr>, pred2: impl Into<Expr>, tag: Tag) {
@@ -575,7 +616,7 @@ impl<'genv, 'tcx> InferCtxtAt<'_, '_, 'genv, 'tcx> {
     ) -> InferResult {
         for clause in clauses {
             if let rty::ClauseKind::Projection(projection_pred) = clause.kind_skipping_binder() {
-                let impl_elem = BaseTy::projection(projection_pred.projection_ty)
+                let impl_elem = BaseTy::Alias(projection_pred.projection_term.to_alias_ty())
                     .to_ty()
                     .deeply_normalize(self)?;
                 let term = projection_pred.term.to_ty().deeply_normalize(self)?;
@@ -596,9 +637,10 @@ impl<'genv, 'tcx> InferCtxtAt<'_, '_, 'genv, 'tcx> {
         a: &Ty,
         b: &Ty,
         reason: ConstrReason,
-    ) -> InferResult {
+    ) -> InferResult<Vec<Binder<rty::CoroutineObligPredicate>>> {
         let mut sub = Sub::new(env, reason, self.span);
-        sub.tys(self.infcx, a, b)
+        sub.tys(self.infcx, a, b)?;
+        Ok(sub.obligations)
     }
 
     /// Relate types via subtyping and returns coroutine obligations. This doesn't handle subtyping
@@ -727,10 +769,53 @@ pub trait LocEnv {
 
     fn unfold_strg_ref(&mut self, infcx: &mut InferCtxt, path: &Path, ty: &Ty) -> InferResult<Loc>;
 
+    /// Temporarily unfolds a `&mut` into a local pointer, see [`crate::fn_subtyping::unfold_local_ptrs`]
+    fn unfold_local_ptr(&mut self, infcx: &mut InferCtxt, bound: &Ty) -> InferResult<Loc>;
+
+    /// Folds all the local pointers created with [`LocEnv::unfold_local_ptr`] back into `&mut`
+    fn fold_local_ptrs(&mut self, infcx: &mut InferCtxtAt) -> InferResult;
+
     fn get(&self, path: &Path) -> Ty;
+
+    fn update_path(&mut self, path: &Path, new_ty: Ty, span: Span);
+
+    fn assume_ensures(&mut self, infcx: &mut InferCtxt, ensures: &[rty::Ensures], span: Span) {
+        for ensure in ensures {
+            match ensure {
+                rty::Ensures::Type(path, updated_ty) => {
+                    let updated_ty = infcx.unpack(updated_ty);
+                    infcx.assume_invariants(&updated_ty);
+                    self.update_path(path, updated_ty, span);
+                }
+                rty::Ensures::Pred(e) => infcx.assume_pred(e),
+            }
+        }
+    }
+
+    fn check_ensures(
+        &mut self,
+        at: &mut InferCtxtAt,
+        ensures: &[rty::Ensures],
+        reason: ConstrReason,
+    ) -> InferResult {
+        for constraint in ensures {
+            match constraint {
+                rty::Ensures::Type(path, ty) => {
+                    let actual_ty = self.get(path).unblocked(); // HACK
+                    at.subtyping(&actual_ty, ty, reason)?;
+                }
+                rty::Ensures::Pred(e) => {
+                    at.check_pred(e, ConstrReason::Ret);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-struct DummyEnv;
+/// An environment without locations. Used when relating types that cannot mention locations, e.g.,
+/// the signatures of fn pointers (which cannot have strong references).
+pub(crate) struct DummyEnv;
 
 impl LocEnv for DummyEnv {
     fn ptr_to_ref(
@@ -741,15 +826,28 @@ impl LocEnv for DummyEnv {
         _: &Path,
         _: Ty,
     ) -> InferResult<Ty> {
-        bug!("call to `ptr_to_ref` on `DummyEnv`")
+        tracked_span_bug!("call to `ptr_to_ref` on `DummyEnv`")
     }
 
     fn unfold_strg_ref(&mut self, _: &mut InferCtxt, _: &Path, _: &Ty) -> InferResult<Loc> {
-        bug!("call to `unfold_str_ref` on `DummyEnv`")
+        tracked_span_bug!("call to `unfold_str_ref` on `DummyEnv`")
+    }
+
+    fn unfold_local_ptr(&mut self, _: &mut InferCtxt, _: &Ty) -> InferResult<Loc> {
+        tracked_span_bug!("call to `unfold_local_ptr` on `DummyEnv`")
+    }
+
+    fn fold_local_ptrs(&mut self, _: &mut InferCtxtAt) -> InferResult {
+        // There are no local pointers to fold
+        Ok(())
     }
 
     fn get(&self, _: &Path) -> Ty {
-        bug!("call to `get` on `DummyEnv`")
+        tracked_span_bug!("call to `get` on `DummyEnv`")
+    }
+
+    fn update_path(&mut self, _: &Path, _: Ty, _: Span) {
+        tracked_span_bug!("call to `update_path` on `DummyEnv`");
     }
 }
 
@@ -921,6 +1019,16 @@ impl<'a, E: LocEnv> Sub<'a, E> {
                 Ok(())
             }
             (BaseTy::Slice(ty_a), BaseTy::Slice(ty_b)) => self.tys(infcx, ty_a, ty_b),
+
+            (BaseTy::RawPtr(ty_a, mut_a), BaseTy::RawPtr(ty_b, mut_b)) => {
+                debug_assert_eq!(mut_a, mut_b);
+                self.tys(infcx, ty_a, ty_b)?;
+                if matches!(mut_a, Mutability::Mut) {
+                    self.tys(infcx, ty_b, ty_a)?;
+                }
+                Ok(())
+            }
+
             (BaseTy::Ref(_, ty_a, Mutability::Mut), BaseTy::Ref(_, ty_b, Mutability::Mut)) => {
                 if ty_a.is_slice()
                     && let TyKind::Indexed(_, idx_a) = ty_a.kind()
@@ -948,32 +1056,43 @@ impl<'a, E: LocEnv> Sub<'a, E> {
                 Ok(())
             }
             (
-                BaseTy::Alias(AliasKind::Opaque, alias_ty_a),
-                BaseTy::Alias(AliasKind::Opaque, alias_ty_b),
+                BaseTy::Alias(AliasTy {
+                    kind: AliasKind::Opaque { def_id: def_id_a },
+                    args: args_a,
+                    refine_args: refine_args_a,
+                }),
+                BaseTy::Alias(AliasTy {
+                    kind: AliasKind::Opaque { def_id: def_id_b },
+                    args: args_b,
+                    refine_args: refine_args_b,
+                }),
             ) => {
-                debug_assert_eq!(alias_ty_a.def_id, alias_ty_b.def_id);
+                debug_assert_eq!(def_id_a, def_id_b);
 
                 // handle type-args
-                for (ty_a, ty_b) in izip!(alias_ty_a.args.iter(), alias_ty_b.args.iter()) {
+                for (ty_a, ty_b) in izip!(args_a.iter(), args_b.iter()) {
                     self.generic_args(infcx, Invariant, ty_a, ty_b)?;
                 }
 
                 // handle refine-args
-                debug_assert_eq!(alias_ty_a.refine_args.len(), alias_ty_b.refine_args.len());
-                iter::zip(alias_ty_a.refine_args.iter(), alias_ty_b.refine_args.iter())
+                debug_assert_eq!(refine_args_a.len(), refine_args_b.len());
+                iter::zip(refine_args_a.iter(), refine_args_b.iter())
                     .for_each(|(expr_a, expr_b)| infcx.unify_exprs(expr_a, expr_b));
 
                 Ok(())
             }
-            (_, BaseTy::Alias(AliasKind::Opaque, alias_ty_b)) => {
+            (
+                _,
+                BaseTy::Alias(AliasTy { kind: AliasKind::Opaque { def_id }, args, refine_args }),
+            ) => {
                 // only for when concrete type on LHS and impl-with-bounds on RHS
-                self.handle_opaque_type(infcx, a, alias_ty_b)
+                self.handle_opaque_type(infcx, a, *def_id, args, refine_args)
             }
             (
-                BaseTy::Alias(AliasKind::Projection, alias_ty_a),
-                BaseTy::Alias(AliasKind::Projection, alias_ty_b),
+                BaseTy::Alias(alias_ty_a @ AliasTy { kind: AliasKind::Projection { .. }, .. }),
+                BaseTy::Alias(alias_ty_b @ AliasTy { kind: AliasKind::Projection { .. }, .. }),
             ) => {
-                tracked_span_dbg_assert_eq!(alias_ty_a, alias_ty_b);
+                tracked_span_dbg_assert_eq!(alias_ty_a.erase_regions(), alias_ty_b.erase_regions());
                 Ok(())
             }
             (BaseTy::Array(ty_a, len_a), BaseTy::Array(ty_b, len_b)) => {
@@ -987,13 +1106,14 @@ impl<'a, E: LocEnv> Sub<'a, E> {
             (BaseTy::Bool, BaseTy::Bool)
             | (BaseTy::Str, BaseTy::Str)
             | (BaseTy::Char, BaseTy::Char)
-            | (BaseTy::RawPtr(_, _), BaseTy::RawPtr(_, _))
             | (BaseTy::RawPtrMetadata(_), BaseTy::RawPtrMetadata(_)) => Ok(()),
             (BaseTy::Dynamic(preds_a, _), BaseTy::Dynamic(preds_b, _)) => {
                 tracked_span_assert_eq!(preds_a.erase_regions(), preds_b.erase_regions());
                 Ok(())
             }
-            (BaseTy::Closure(did1, tys_a, _), BaseTy::Closure(did2, tys_b, _)) if did1 == did2 => {
+            (BaseTy::Closure(did1, tys_a, _, _), BaseTy::Closure(did2, tys_b, _, _))
+                if did1 == did2 =>
+            {
                 debug_assert_eq!(tys_a.len(), tys_b.len());
                 for (ty_a, ty_b) in iter::zip(tys_a, tys_b) {
                     self.tys(infcx, ty_a, ty_b)?;
@@ -1001,11 +1121,29 @@ impl<'a, E: LocEnv> Sub<'a, E> {
                 Ok(())
             }
             (BaseTy::FnPtr(sig_a), BaseTy::FnPtr(sig_b)) => {
-                tracked_span_assert_eq!(sig_a.erase_regions(), sig_b.erase_regions());
-                Ok(())
+                if sig_a == sig_b {
+                    return Ok(());
+                }
+                let sub_sig = SubFn::Mono(sig_a.clone());
+                check_fn_subtyping(infcx, &mut DummyEnv, sub_sig, sig_b, self.span)
             }
             (BaseTy::Never, BaseTy::Never) => Ok(()),
-            _ => Err(query_bug!("incompatible base types: `{a:?}` - `{b:?}`"))?,
+            (
+                BaseTy::Coroutine(did1, resume_ty_a, tys_a, _),
+                BaseTy::Coroutine(did2, resume_ty_b, tys_b, _),
+            ) if did1 == did2 => {
+                debug_assert_eq!(tys_a.len(), tys_b.len());
+                for (ty_a, ty_b) in iter::zip(tys_a, tys_b) {
+                    self.tys(infcx, ty_a, ty_b)?;
+                }
+                // TODO(RJ): Treating resume type as invariant...but I think they should be contravariant(?)
+                self.tys(infcx, resume_ty_b, resume_ty_a)?;
+                self.tys(infcx, resume_ty_a, resume_ty_b)?;
+
+                Ok(())
+            }
+            (BaseTy::Foreign(did_a), BaseTy::Foreign(did_b)) if did_a == did_b => Ok(()),
+            _ => Err(query_bug!("incompatible base types: `{a:#?}` - `{b:#?}`"))?,
         }
     }
 
@@ -1019,7 +1157,10 @@ impl<'a, E: LocEnv> Sub<'a, E> {
         let (ty_a, ty_b) = match (a, b) {
             (GenericArg::Ty(ty_a), GenericArg::Ty(ty_b)) => (ty_a.clone(), ty_b.clone()),
             (GenericArg::Base(ctor_a), GenericArg::Base(ctor_b)) => {
-                tracked_span_dbg_assert_eq!(ctor_a.sort(), ctor_b.sort());
+                tracked_span_dbg_assert_eq!(
+                    ctor_a.sort().erase_regions(),
+                    ctor_b.sort().erase_regions()
+                );
                 (ctor_a.to_ty(), ctor_b.to_ty())
             }
             (GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => return Ok(()),
@@ -1059,10 +1200,22 @@ impl<'a, E: LocEnv> Sub<'a, E> {
                     self.idxs_eq(infcx, a, b);
                 }
             }
+            (ExprKind::Ctor(Ctor::RawPtr, flds_a), ExprKind::Ctor(Ctor::RawPtr, flds_b)) => {
+                for (a, b) in iter::zip(flds_a, flds_b) {
+                    self.idxs_eq(infcx, a, b);
+                }
+            }
             (_, ExprKind::Tuple(flds_b)) => {
                 for (f, b) in flds_b.iter().enumerate() {
                     let proj = FieldProj::Tuple { arity: flds_b.len(), field: f as u32 };
                     let a = a.proj_and_reduce(proj);
+                    self.idxs_eq(infcx, &a, b);
+                }
+            }
+            (_, ExprKind::Ctor(Ctor::RawPtr, flds_b)) => {
+                for (f, b) in flds_b.iter().enumerate() {
+                    let field = rty::RawPtrField::from_index(f as u32).unwrap();
+                    let a = a.proj_and_reduce(FieldProj::RawPtr { field });
                     self.idxs_eq(infcx, &a, b);
                 }
             }
@@ -1080,6 +1233,14 @@ impl<'a, E: LocEnv> Sub<'a, E> {
                 for (f, a) in flds_a.iter().enumerate() {
                     let proj = FieldProj::Tuple { arity: flds_a.len(), field: f as u32 };
                     let b = b.proj_and_reduce(proj);
+                    self.idxs_eq(infcx, a, &b);
+                }
+            }
+            (ExprKind::Ctor(Ctor::RawPtr, flds_a), _) => {
+                infcx.unify_exprs(a, b);
+                for (f, a) in flds_a.iter().enumerate() {
+                    let field = rty::RawPtrField::from_index(f as u32).unwrap();
+                    let b = b.proj_and_reduce(FieldProj::RawPtr { field });
                     self.idxs_eq(infcx, a, &b);
                 }
             }
@@ -1132,30 +1293,36 @@ impl<'a, E: LocEnv> Sub<'a, E> {
         &mut self,
         infcx: &mut InferCtxt,
         bty: &BaseTy,
-        alias_ty: &AliasTy,
+        opaque_def_id: DefId,
+        opaque_args: &rty::GenericArgs,
+        opaque_refine_args: &rty::RefineArgs,
     ) -> InferResult {
-        if let BaseTy::Coroutine(def_id, resume_ty, upvar_tys) = bty {
+        if let BaseTy::Coroutine(def_id, resume_ty, upvar_tys, args) = bty {
             let obligs = mk_coroutine_obligations(
                 infcx.genv,
                 def_id,
                 resume_ty,
                 upvar_tys,
-                &alias_ty.def_id,
+                &opaque_def_id,
+                args.clone(),
             )?;
             self.obligations.extend(obligs);
         } else {
-            let bounds = infcx.genv.item_bounds(alias_ty.def_id)?.instantiate(
+            let bounds = infcx.genv.item_bounds(opaque_def_id)?.instantiate(
                 infcx.tcx(),
-                &alias_ty.args,
-                &alias_ty.refine_args,
+                opaque_args,
+                opaque_refine_args,
             );
             for clause in &bounds {
                 if !clause.kind().vars().is_empty() {
                     Err(query_bug!("handle_opaque_types: clause with bound vars: `{clause:?}`"))?;
                 }
                 if let rty::ClauseKind::Projection(pred) = clause.kind_skipping_binder() {
-                    let alias_ty = pred.projection_ty.with_self_ty(bty.to_subset_ty_ctor());
-                    let ty1 = BaseTy::Alias(AliasKind::Projection, alias_ty)
+                    let alias_ty = pred
+                        .projection_term
+                        .with_self_ty(bty.to_subset_ty_ctor())
+                        .to_alias_ty();
+                    let ty1 = BaseTy::Alias(alias_ty)
                         .to_ty()
                         .deeply_normalize(&mut infcx.at(self.span))?;
                     let ty2 = pred.term.to_ty();
@@ -1173,6 +1340,7 @@ fn mk_coroutine_obligations(
     resume_ty: &Ty,
     upvar_tys: &List<Ty>,
     opaque_def_id: &DefId,
+    args: flux_rustc_bridge::ty::GenericArgs,
 ) -> InferResult<Vec<Binder<rty::CoroutineObligPredicate>>> {
     let bounds = genv.item_bounds(*opaque_def_id)?.skip_binder();
     for bound in &bounds {
@@ -1184,6 +1352,7 @@ fn mk_coroutine_obligations(
                     resume_ty: resume_ty.clone(),
                     upvar_tys: upvar_tys.clone(),
                     output: output.to_ty(),
+                    args,
                 }
             })]);
         }

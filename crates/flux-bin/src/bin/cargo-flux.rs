@@ -12,15 +12,23 @@ use flux_bin::{
     cargo_flux_opts::{CargoFluxCommand, Cli},
     utils::{
         EXIT_ERR, flux_sysroot_dir, get_binary_path, get_flux_driver_path, get_rust_toolchain,
+        print_version_and_exit,
     },
 };
 use itertools::Itertools;
 use tempfile::NamedTempFile;
 
 fn main() {
-    let Cli::Flux { check_opts, command } = Cli::parse();
+    let Cli::Flux { check_opts, command, version, verbose } = Cli::parse();
 
-    match run(command.unwrap_or(CargoFluxCommand::Check(check_opts))) {
+    // Handle version flag (-V or --version with optional -v for verbose)
+    if version {
+        print_version_and_exit("cargo-flux", verbose > 0);
+    }
+
+    let command = command.unwrap_or(CargoFluxCommand::Check(check_opts));
+
+    match run(command) {
         Ok(exit_code) => exit(exit_code),
         Err(e) => {
             println!("Failed to run `cargo-flux`, error={e}");
@@ -34,10 +42,9 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     let cargo_path = get_binary_path(&toolchain, "cargo")?;
 
     let metadata = cargo_flux_cmd.metadata().cargo_path(&cargo_path).exec()?;
-    let config_file = write_cargo_config(metadata)?;
-
     let sysroot = flux_sysroot_dir();
     let flux_driver_path = get_flux_driver_path(&sysroot)?;
+    let config_file = write_cargo_config(metadata, &sysroot, &cargo_flux_cmd)?;
 
     let mut cargo_command = Command::new("cargo");
 
@@ -55,7 +62,11 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     Ok(cargo_command.status()?.code().unwrap_or(EXIT_ERR))
 }
 
-fn write_cargo_config(metadata: Metadata) -> anyhow::Result<NamedTempFile> {
+fn write_cargo_config(
+    metadata: Metadata,
+    sysroot: &std::path::Path,
+    cargo_flux_cmd: &CargoFluxCommand,
+) -> anyhow::Result<NamedTempFile> {
     let flux_flags: Option<Vec<String>> = if let Ok(flags) = env::var("FLUXFLAGS") {
         Some(flags.split(" ").map(Into::into).collect())
     } else {
@@ -69,6 +80,8 @@ fn write_cargo_config(metadata: Metadata) -> anyhow::Result<NamedTempFile> {
     if flux_toml.get_bool("enabled").is_ok() {
         return Err(anyhow!("`enabled` cannot be set in `flux.toml`"));
     }
+    let targeted_package_ids = cargo_flux_cmd.targeted_package_ids(&metadata);
+    let cli_flags = cargo_flux_cmd.rustflags();
 
     let mut file = NamedTempFile::new()?;
     {
@@ -108,6 +121,8 @@ incremental = false
                     .strip_prefix(&metadata.workspace_root)
                     .ok()
                     .and_then(Utf8Path::parent);
+
+                let sysroot_flag = format!("-Fsysroot={}", sysroot.display());
                 write!(
                     w,
                     r#"
@@ -116,11 +131,18 @@ rustflags = [{:?}]
                         "#,
                     package.id,
                     flux_metadata
-                        .into_flags(&metadata.target_directory, manifest_dir_relative_to_workspace)
+                        .into_flags(
+                            &metadata.target_directory,
+                            manifest_dir_relative_to_workspace,
+                            cargo_flux_cmd
+                                .only_check()
+                                .filter(|_| targeted_package_ids.contains(&package.id))
+                        )
                         .iter()
                         .chain(flux_flags.iter().flatten())
-                        .map(|s| s.as_ref())
-                        .chain(["-Fverify=on", "-Ffull-compilation=on"])
+                        .chain(cli_flags.iter())
+                        .map(|s| s.as_str())
+                        .chain(["-Fverify=on", "-Ffull-compilation=on", sysroot_flag.as_str()])
                         .format(", ")
                 )?;
             }

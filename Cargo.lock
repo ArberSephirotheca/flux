@@ -30,16 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "annotate-snippets"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "710e8eae58854cdc1790fcb56cca04d712a17be849eeb81da2a724bf4bae2bc4"
-dependencies = [
- "anstyle",
- "unicode-width",
-]
-
-[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -94,6 +84,12 @@ name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+
+[[package]]
+name = "attr_alias"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f648697f71a7eddd152c1ae26151f580c69635bfcb747574886317877ccf1a5a"
 
 [[package]]
 name = "autocfg"
@@ -469,7 +465,7 @@ dependencies = [
  "clap",
  "config",
  "flux-config",
- "home",
+ "flux-sysroot",
  "itertools 0.14.0",
  "serde",
  "serde_json",
@@ -492,6 +488,7 @@ dependencies = [
 name = "flux-config"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "globset",
  "serde",
  "toml",
@@ -521,6 +518,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-dev"
+version = "0.1.0"
+
+[[package]]
 name = "flux-driver"
 version = "0.1.0"
 dependencies = [
@@ -533,9 +534,11 @@ dependencies = [
  "flux-macros",
  "flux-metadata",
  "flux-middle",
+ "flux-opt",
  "flux-refineck",
  "flux-rustc-bridge",
  "flux-syntax",
+ "flux-sysroot",
  "itertools 0.14.0",
  "serde",
  "serde_json",
@@ -578,9 +581,11 @@ dependencies = [
  "flux-macros",
  "flux-middle",
  "flux-rustc-bridge",
+ "indexmap",
  "itertools 0.14.0",
  "liquid-fixpoint",
  "pad-adapter",
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -592,15 +597,14 @@ dependencies = [
 name = "flux-macros"
 version = "0.1.0"
 dependencies = [
- "annotate-snippets",
  "fluent-bundle",
  "fluent-syntax",
+ "indexmap",
  "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
  "synstructure",
- "unic-langid",
 ]
 
 [[package]]
@@ -641,6 +645,24 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toposort-scc",
+ "tracing",
+]
+
+[[package]]
+name = "flux-opt"
+version = "0.1.0"
+dependencies = [
+ "flux-common",
+ "flux-config",
+ "flux-errors",
+ "flux-macros",
+ "flux-middle",
+ "flux-rustc-bridge",
+ "itertools 0.14.0",
+ "liquid-fixpoint",
+ "rustc-hash",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -687,7 +709,15 @@ version = "0.1.0"
 dependencies = [
  "flux-config",
  "flux-macros",
- "rustc-hash",
+]
+
+[[package]]
+name = "flux-sysroot"
+version = "0.1.0"
+dependencies = [
+ "home",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -883,6 +913,7 @@ dependencies = [
  "derive-where",
  "indexmap",
  "itertools 0.14.0",
+ "process_control",
  "serde",
  "serde_json",
  "z3",
@@ -1076,18 +1107,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "proc-macro-hack"
-version = "0.5.20+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc375e1527247fe1a97d8b7156678dfe7c1af2fc075c9a4db3690ecd2a148068"
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process_control"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21ed1a985a1edcf511a65a9927151fab108e72206a2ee3c62f8946ab73dfc33d"
+dependencies = [
+ "attr_alias",
+ "libc",
+ "signal-hook",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1198,6 +1235,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1287,6 +1333,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1362,6 +1428,8 @@ name = "tests"
 version = "0.1.0"
 dependencies = [
  "compiletest_rs",
+ "flux-dev",
+ "flux-sysroot",
  "itertools 0.14.0",
 ]
 
@@ -1556,7 +1624,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ba52c9b05311f4f6e62d5d9d46f094bd6e84cb8df7b3ef952748d752a7d05"
 dependencies = [
  "unic-langid-impl",
- "unic-langid-macros",
 ]
 
 [[package]]
@@ -1566,30 +1633,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dce1bf08044d4b7a94028c93786f8566047edc11110595914de93362559bc658"
 dependencies = [
  "tinystr",
-]
-
-[[package]]
-name = "unic-langid-macros"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5957eb82e346d7add14182a3315a7e298f04e1ba4baac36f7f0dbfedba5fc25"
-dependencies = [
- "proc-macro-hack",
- "tinystr",
- "unic-langid-impl",
- "unic-langid-macros-impl",
-]
-
-[[package]]
-name = "unic-langid-macros-impl"
-version = "0.9.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1249a628de3ad34b821ecb1001355bca3940bcb2f88558f1a8bd82e977f75b5"
-dependencies = [
- "proc-macro-hack",
- "quote",
- "syn",
- "unic-langid-impl",
 ]
 
 [[package]]
@@ -1623,6 +1666,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1652,6 +1705,15 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"
@@ -1857,8 +1919,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cargo_metadata",
- "home",
- "tests",
+ "flux-dev",
+ "flux-sysroot",
+ "serde",
+ "toml",
+ "walkdir",
  "xflags",
 ]
 

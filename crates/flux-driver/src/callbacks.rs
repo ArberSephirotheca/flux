@@ -1,9 +1,10 @@
-use std::path::Path;
-
 use flux_common::{bug, cache::QueryCache, iter::IterExt, result::ResultExt};
 use flux_config::{self as config};
 use flux_errors::FluxSession;
-use flux_infer::{fixpoint_encoding::FixQueryCache, lean_encoding};
+use flux_infer::{
+    fixpoint_encoding::{FixQueryCache, LeanStatus, lean_task_key},
+    lean_encoding,
+};
 use flux_metadata::CStore;
 use flux_middle::{
     Specs,
@@ -14,20 +15,18 @@ use flux_middle::{
     queries::{Providers, QueryResult},
 };
 use flux_refineck as refineck;
-use itertools::Itertools;
 use rustc_borrowck::consumers::ConsumerOptions;
 use rustc_driver::{Callbacks, Compilation};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::{
-    def::DefKind,
-    def_id::{DefId, LOCAL_CRATE, LocalDefId},
+    def::{CtorKind, DefKind},
+    def_id::{LOCAL_CRATE, LocalDefId},
 };
 use rustc_interface::interface::Compiler;
-use rustc_middle::{query, ty::TyCtxt};
+use rustc_middle::{queries, ty::TyCtxt, util};
 use rustc_session::config::OutputType;
-use rustc_span::FileName;
 
-use crate::{DEFAULT_LOCALE_RESOURCES, collector::SpecCollector};
+use crate::collector::SpecCollector;
 
 #[derive(Default)]
 pub struct FluxCallbacks;
@@ -37,12 +36,16 @@ impl Callbacks for FluxCallbacks {
         assert!(config.override_queries.is_none());
 
         config.override_queries = Some(|_, local| {
-            local.mir_borrowck = mir_borrowck;
+            local.queries.mir_borrowck = mir_borrowck;
         });
         // this should always be empty otherwise something changed in rustc and all our assumptions
         // about symbol interning are wrong.
         assert!(config.extra_symbols.is_empty());
         config.extra_symbols = flux_syntax::symbols::PREDEFINED_FLUX_SYMBOLS.to_vec();
+
+        if flux_config::std_extern_specs() {
+            inject_std_extern_specs(config);
+        }
     }
 
     fn after_analysis(&mut self, compiler: &Compiler, tcx: TyCtxt<'_>) -> Compilation {
@@ -57,13 +60,10 @@ impl FluxCallbacks {
             return;
         }
 
-        let sess = FluxSession::new(
-            &tcx.sess.opts,
-            tcx.sess.psess.clone_source_map(),
-            rustc_errors::fallback_fluent_bundle(DEFAULT_LOCALE_RESOURCES.to_vec(), false),
-        );
+        let sess = FluxSession::new(&tcx.sess.opts, tcx.sess.psess.clone_source_map());
 
         let mut providers = Providers::default();
+        flux_opt::provide(&mut providers);
         flux_desugar::provide(&mut providers);
         flux_fhir_analysis::provide(&mut providers);
         providers.collect_specs = collect_specs;
@@ -82,38 +82,109 @@ impl FluxCallbacks {
     }
 }
 
+fn load_extern_specs() -> Vec<(String, std::path::PathBuf)> {
+    use flux_sysroot::SysrootManifest;
+    let Some(sysroot) = config::sysroot() else { return vec![] };
+    SysrootManifest::extern_specs(&sysroot)
+}
+
+fn inject_std_extern_specs(config: &mut rustc_interface::interface::Config) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use rustc_session::{
+        config::{ExternEntry, ExternLocation, Externs},
+        utils::CanonicalizedPath,
+    };
+
+    let specs = load_extern_specs();
+    if specs.is_empty() {
+        return;
+    }
+
+    let mut map: BTreeMap<String, ExternEntry> = config
+        .opts
+        .externs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    for (crate_name, rmeta_path) in specs {
+        let entry = ExternEntry {
+            location: ExternLocation::ExactPaths(BTreeSet::from([CanonicalizedPath::new(
+                rmeta_path,
+            )])),
+            is_private_dep: false,
+            add_prelude: true,
+            nounused_dep: true,
+            force: true,
+        };
+        map.insert(crate_name, entry);
+    }
+
+    config.opts.externs = Externs::new(map);
+}
+
 fn check_crate(genv: GlobalEnv) -> Result<(), ErrorGuaranteed> {
     tracing::info_span!("check_crate").in_scope(move || {
         tracing::info!("Callbacks::check_wf");
-        // Query qualifiers and spec funcs to report wf errors
+        // Query qualifiers, axioms and spec funcs to report wf errors
         let _ = genv.qualifiers().emit(&genv)?;
-        let _ = genv.normalized_defns(LOCAL_CRATE);
+        let _ = genv.axioms().emit(&genv)?;
+        let _ = genv.spec_funcs(LOCAL_CRATE);
 
         let mut ck = CrateChecker::new(genv);
 
-        let crate_items = genv.tcx().hir_crate_items(());
-
-        let dups = crate_items.definitions().duplicates().collect_vec();
-        if !dups.is_empty() {
-            bug!("TODO: {dups:#?}");
-        }
-        let result = crate_items
-            .definitions()
+        // Iterate over all def ids including dummy items for extern specs
+        let result = genv
+            .tcx()
+            .iter_local_def_id()
             .try_for_each_exhaust(|def_id| ck.check_def_catching_bugs(def_id));
 
-        if config::lean().is_emit() {
+        if config::lean().is_check() || config::lean().is_emit() {
             lean_encoding::finalize(genv)
                 .unwrap_or_else(|err| bug!("error running lean-check {err:?}"));
         }
 
         let lean_result = if config::lean().is_check() {
-            crate_items.definitions().try_for_each_exhaust(|def_id| {
-                if genv.proven_externally(def_id).is_some() {
-                    lean_encoding::check_proof(genv, def_id.to_def_id())
-                } else {
-                    Ok(())
-                }
-            })
+            // A cached proof is only valid if the lean project has not changed since it was checked
+            let digest = if config::is_cache_enabled() {
+                lean_encoding::project_digest(genv).ok()
+            } else {
+                None
+            };
+            let pending = genv
+                .iter_local_def_id()
+                .filter(|def_id| {
+                    // Skip proof check if not included or not proven externally
+                    genv.included(genv.maybe_extern_id(*def_id))
+                        && genv.proven_externally(*def_id).is_some()
+                })
+                .map(|def_id| def_id.to_def_id())
+                .filter(|def_id| {
+                    // Skip proof check if previously verified successfully.
+                    let key = lean_task_key(genv.tcx(), *def_id);
+                    let cached = ck.cache.lookup_by_key(&key).map(|r| &r.lean_status);
+                    !matches!((cached, digest), (Some(LeanStatus::Valid(d1)), Some(d2)) if *d1 == d2)
+                })
+                .collect::<Vec<_>>();
+            // Check all the pending proofs with a single `lake build`
+            let results = lean_encoding::check_proofs(genv, &pending);
+            pending
+                .iter()
+                .zip(results)
+                .map(|(def_id, result)| {
+                    if result.is_ok()
+                        && let Some(digest) = digest
+                    {
+                        // Mark as valid in cache so future runs skip re-verification.
+                        let key = lean_task_key(genv.tcx(), *def_id);
+                        ck.cache.update_result_by_key(&key, |r| {
+                            r.lean_status = LeanStatus::Valid(digest);
+                        });
+                    }
+                    result
+                })
+                .try_for_each_exhaust(|result| result)
         } else {
             Ok(())
         };
@@ -136,16 +207,6 @@ fn collect_specs(genv: GlobalEnv) -> Specs {
 }
 
 fn encode_and_save_metadata(genv: GlobalEnv) {
-    // HACK(nilehmann) do not encode metadata for `core`, this is so verify-rust-std works even
-    // if it has unsupported items. We report errors lazily so partially analyzing the crate should
-    // skip the error, except that encoding the metadata for the crate will trigger conversion for
-    // all items which can trigger the error even if not included for analysis. To fix this properly
-    // we should consider how to handle metadata encoding if only part of the crate is included for
-    // analysis.
-    if genv.tcx().crate_name(LOCAL_CRATE) == flux_syntax::symbols::sym::core {
-        return;
-    }
-
     // We only save metadata when `--emit=metadata` is passed as an argument. In this case, we save
     // the `.fluxmeta` file alongside the `.rmeta` file. This setup works for `cargo flux`, which
     // wraps `cargo check` and always passes `--emit=metadata`. Tests also explicitly pass this flag.
@@ -170,76 +231,6 @@ impl<'genv, 'tcx> CrateChecker<'genv, 'tcx> {
         Self { genv, cache: QueryCache::load() }
     }
 
-    fn matches_def(&self, def_id: MaybeExternId, def: &str) -> bool {
-        // Does this def_id's name contain `fn_name`?
-        let def_path = self.genv.tcx().def_path_str(def_id.local_id());
-        def_path.contains(def)
-    }
-
-    fn matches_file_path<F>(&self, def_id: MaybeExternId, matcher: F) -> bool
-    where
-        F: Fn(&Path) -> bool,
-    {
-        let def_id = def_id.local_id();
-        let tcx = self.genv.tcx();
-        let span = tcx.def_span(def_id);
-        let sm = tcx.sess.source_map();
-        let FileName::Real(file_name) = sm.span_to_filename(span) else { return true };
-        let mut file_path = file_name.local_path_if_available();
-
-        // If the path is absolute try to normalize it to be relative to the working_dir
-        if file_path.is_absolute() {
-            let working_dir = tcx.sess.opts.working_dir.local_path_if_available();
-            let Ok(p) = file_path.strip_prefix(working_dir) else { return true };
-            file_path = p;
-        }
-
-        matcher(file_path)
-    }
-
-    fn matches_pos(&self, def_id: MaybeExternId, line: usize, col: usize) -> bool {
-        let def_id = def_id.local_id();
-        let tcx = self.genv.tcx();
-        let hir_id = tcx.local_def_id_to_hir_id(def_id);
-        let body_span = tcx.hir_span_with_body(hir_id);
-        let source_map = tcx.sess.source_map();
-        let lo_pos = source_map.lookup_char_pos(body_span.lo());
-        let start_line = lo_pos.line;
-        let start_col = lo_pos.col_display;
-        let hi_pos = source_map.lookup_char_pos(body_span.hi());
-        let end_line = hi_pos.line;
-        let end_col = hi_pos.col_display;
-
-        // is the line in the range of the body?
-        if start_line < end_line {
-            // multiple lines: check if the line is in the range
-            start_line <= line && line <= end_line
-        } else {
-            // single line: check if the line is the same and the column is in range
-            start_line == line && start_col <= col && col <= end_col
-        }
-    }
-
-    /// Check whether the `def_id` (or the file where `def_id` is defined)
-    /// is in the `include` pattern, and conservatively return `true` if
-    /// anything unexpected happens.
-    fn is_included(&self, def_id: MaybeExternId) -> bool {
-        let Some(pattern) = config::include_pattern() else { return true };
-        if self.matches_file_path(def_id, |path| pattern.glob.is_match(path)) {
-            return true;
-        }
-        if pattern.defs.iter().any(|def| self.matches_def(def_id, def)) {
-            return true;
-        }
-        if pattern.spans.iter().any(|pos| {
-            self.matches_file_path(def_id, |path| path.ends_with(&pos.file))
-                && self.matches_pos(def_id, pos.line, pos.column)
-        }) {
-            return true;
-        }
-        false
-    }
-
     fn check_def_catching_bugs(&mut self, def_id: LocalDefId) -> Result<(), ErrorGuaranteed> {
         let mut this = std::panic::AssertUnwindSafe(self);
         let msg = format!("def_id: {:?}, span: {:?}", def_id, this.genv.tcx().def_span(def_id));
@@ -247,14 +238,15 @@ impl<'genv, 'tcx> CrateChecker<'genv, 'tcx> {
     }
 
     fn check_def(&mut self, def_id: LocalDefId) -> Result<(), ErrorGuaranteed> {
-        let def_id = self.genv.maybe_extern_id(def_id);
+        let genv = self.genv;
+        let def_id = genv.maybe_extern_id(def_id);
 
         // Dummy items generated for extern specs are excluded from metrics
-        if self.genv.is_dummy(def_id.local_id()) {
+        if genv.is_dummy(def_id.local_id()) {
             return Ok(());
         }
 
-        let kind = self.genv.def_kind(def_id);
+        let kind = genv.def_kind(def_id);
 
         // For the purpose of metrics, we consider to be a *function* an item that
         // 1. It's local, i.e., it's not an extern spec.
@@ -266,96 +258,135 @@ impl<'genv, 'tcx> CrateChecker<'genv, 'tcx> {
             .as_local()
             .map(|local_id| {
                 matches!(kind, DefKind::Fn | DefKind::AssocFn)
-                    && self.genv.tcx().is_mir_available(local_id)
+                    && genv.tcx().is_mir_available(local_id)
             })
             .unwrap_or(false);
 
         metrics::incr_metric_if(is_fn_with_body, Metric::FnTotal);
 
-        if self.genv.ignored(def_id.local_id()) {
+        if genv.ignored(def_id.local_id()) {
             metrics::incr_metric_if(is_fn_with_body, Metric::FnIgnored);
             return Ok(());
         }
-        if !self.is_included(def_id) {
+        if !self.genv.included(def_id) {
             metrics::incr_metric_if(is_fn_with_body, Metric::FnTrusted);
             return Ok(());
         }
 
+        trigger_queries(genv, def_id).emit(&genv)?;
+
         match kind {
             DefKind::Fn | DefKind::AssocFn => {
-                // Make sure we run conversion and report errors even if we skip the function
-                force_conv(self.genv, def_id.resolved_id()).emit(&self.genv)?;
                 let Some(local_id) = def_id.as_local() else { return Ok(()) };
                 if is_fn_with_body {
-                    refineck::check_fn(self.genv, &mut self.cache, local_id)?;
+                    refineck::check_fn(genv, &mut self.cache, local_id)?;
                 }
-                Ok(())
             }
             DefKind::Enum => {
-                self.genv.check_wf(def_id.local_id()).emit(&self.genv)?;
-                self.genv.variants_of(def_id).emit(&self.genv)?;
-                let adt_def = self.genv.adt_def(def_id).emit(&self.genv)?;
-                let enum_def = self
-                    .genv
+                let adt_def = genv.adt_def(def_id).emit(&genv)?;
+                let enum_def = genv
                     .fhir_expect_item(def_id.local_id())
-                    .emit(&self.genv)?
+                    .emit(&genv)?
                     .expect_enum();
                 refineck::invariants::check_invariants(
-                    self.genv,
+                    genv,
                     &mut self.cache,
                     def_id,
                     enum_def.invariants,
                     &adt_def,
-                )
+                )?;
             }
             DefKind::Struct => {
-                // We check invariants for `struct` in `check_constructor` (i.e. when the struct is built).
-                // However, we leave the below code in to force the queries that do the conversions that check
-                // for ill-formed annotations e.g. see tests/tests/neg/error_messages/annot_check/struct_error.rs
-                self.genv.check_wf(def_id.local_id()).emit(&self.genv)?;
-                self.genv.adt_def(def_id).emit(&self.genv)?;
-                self.genv.variants_of(def_id).emit(&self.genv)?;
-                let _struct_def = self
-                    .genv
-                    .fhir_expect_item(def_id.local_id())
-                    .emit(&self.genv)?
-                    .expect_struct();
-                Ok(())
+                // We check invariants for `struct` in `check_constructor` (i.e. when the struct is built),
+                // so nothing to do here.
             }
             DefKind::Impl { of_trait } => {
-                self.genv.check_wf(def_id.local_id()).emit(&self.genv)?;
                 if of_trait {
-                    refineck::compare_impl_item::check_impl_against_trait(self.genv, def_id)
-                        .emit(&self.genv)?;
+                    refineck::compare_impl_item::check_impl_against_trait(genv, def_id)
+                        .emit(&genv)?;
                 }
-                Ok(())
             }
-            DefKind::TyAlias => {
-                self.genv.check_wf(def_id.local_id()).emit(&self.genv)?;
-                self.genv.type_of(def_id).emit(&self.genv)?;
-                Ok(())
+            DefKind::TyAlias => {}
+            DefKind::Trait => {}
+            DefKind::Static { .. } => {
+                // Extern (i.e. foreign) statics have no body (initializer) to check
+                if let Some(local_id) = def_id.as_local()
+                    && genv.tcx().hir_node_by_def_id(local_id).body_id().is_some()
+                {
+                    // A static without a spec is checked against the default refinement of its
+                    // type, e.g., to check the field specs of a struct in the initializer.
+                    let ty = genv.static_info(def_id).emit(&genv)?;
+                    refineck::check_static(genv, &mut self.cache, local_id, ty)?;
+                }
             }
-            DefKind::Trait => {
-                self.genv.check_wf(def_id.local_id()).emit(&self.genv)?;
-                Ok(())
-            }
-            _ => Ok(()),
+            _ => (),
         }
+        Ok(())
     }
 }
 
-fn force_conv(genv: GlobalEnv, def_id: DefId) -> QueryResult {
-    genv.generics_of(def_id)?;
-    genv.refinement_generics_of(def_id)?;
-    genv.predicates_of(def_id)?;
-    genv.fn_sig(def_id)?;
+/// Triggers queries for the given `def_id` to mark it as "reached" for metadata encoding.
+///
+/// This function ensures that all relevant queries for a definition are triggered upfront,
+/// so the item and its associated data will be included in the encoded metadata. Without this,
+/// items might be missing from the metadata (extern specs in particular which are not otherwise "checked"),
+/// causing errors when dependent crates try to use them.
+fn trigger_queries(genv: GlobalEnv, def_id: MaybeExternId) -> QueryResult {
+    match genv.def_kind(def_id) {
+        DefKind::Trait => {
+            genv.generics_of(def_id)?;
+            genv.predicates_of(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+        }
+        DefKind::Impl { .. } => {
+            genv.generics_of(def_id)?;
+            genv.predicates_of(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+        }
+        DefKind::Fn | DefKind::AssocFn => {
+            genv.generics_of(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+            genv.predicates_of(def_id)?;
+            genv.fn_sig(def_id)?;
+        }
+        DefKind::Ctor(_, CtorKind::Fn) => {
+            genv.generics_of(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+            // We don't report the error because it can raise a `QueryErr::OpaqueStruct`,  which
+            // should be reported at the use site.
+            let _ = genv.fn_sig(def_id);
+        }
+        DefKind::Enum | DefKind::Struct => {
+            genv.generics_of(def_id)?;
+            genv.predicates_of(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+            genv.adt_def(def_id)?;
+            genv.invariants_of(def_id);
+            genv.adt_sort_def_of(def_id)?;
+            genv.variants_of(def_id)?;
+            genv.type_of(def_id)?;
+        }
+        DefKind::TyAlias => {
+            genv.generics_of(def_id)?;
+            genv.predicates_of(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+            genv.type_of(def_id)?;
+        }
+        DefKind::OpaqueTy => {
+            genv.generics_of(def_id)?;
+            genv.predicates_of(def_id)?;
+            genv.item_bounds(def_id)?;
+            genv.refinement_generics_of(def_id)?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
 fn mir_borrowck<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-) -> query::queries::mir_borrowck::ProvidedValue<'tcx> {
+) -> queries::mir_borrowck::ProvidedValue<'tcx> {
     let bodies_with_facts = rustc_borrowck::consumers::get_bodies_with_borrowck_facts(
         tcx,
         def_id,
@@ -368,8 +399,8 @@ fn mir_borrowck<'tcx>(
             flux_common::mir_storage::store_mir_body(tcx, def_id, body_with_facts);
         }
     }
-    let mut providers = query::Providers::default();
-    rustc_borrowck::provide(&mut providers);
-    let original_mir_borrowck = providers.mir_borrowck;
+    let mut providers = util::Providers::default();
+    rustc_borrowck::provide(&mut providers.queries);
+    let original_mir_borrowck = providers.queries.mir_borrowck;
     original_mir_borrowck(tcx, def_id)
 }

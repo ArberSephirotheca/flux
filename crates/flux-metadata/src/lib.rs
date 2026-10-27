@@ -1,16 +1,17 @@
 #![allow(incomplete_features)]
-#![feature(rustc_private, specialization, if_let_guard)]
+#![feature(rustc_private)]
 
 extern crate rustc_ast;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_hir;
 extern crate rustc_macros;
-extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
+extern crate rustc_type_ir;
 
 mod decoder;
 mod encoder;
@@ -24,8 +25,9 @@ use std::{hash::Hash, path::PathBuf, rc::Rc};
 use decoder::decode_crate_metadata;
 use derive_where::derive_where;
 use flux_errors::FluxSession;
-use flux_macros::fluent_messages;
 use flux_middle::{
+    PanicSpec,
+    call_graph::NodeKey,
     cstore::{CrateStore, OptResult},
     def_id::{FluxDefId, FluxId},
     fhir,
@@ -35,7 +37,7 @@ use flux_middle::{
 };
 use rustc_data_structures::{
     fx::FxHashMap,
-    unord::{ExtendUnord, UnordMap},
+    unord::{ExtendUnord, UnordMap, UnordSet},
 };
 use rustc_hir::{
     def::{CtorKind, DefKind},
@@ -43,6 +45,7 @@ use rustc_hir::{
 };
 use rustc_macros::{Decodable, Encodable, TyDecodable, TyEncodable};
 use rustc_middle::ty::TyCtxt;
+use rustc_serialize::ContextOrd;
 use rustc_session::config::OutFileName;
 use rustc_span::{
     SourceFile, Span, StableSourceFileId,
@@ -51,15 +54,13 @@ use rustc_span::{
 
 pub use crate::encoder::encode_metadata;
 
-fluent_messages! { "../locales/en-US.ftl" }
-
 const METADATA_VERSION: u8 = 0;
 const METADATA_HEADER: &[u8] = &[b'f', b'l', b'u', b'x', 0, 0, 0, METADATA_VERSION];
 
 #[derive(Default)]
-pub struct CStore {
-    local_tables: UnordMap<CrateNum, Tables<DefIndex>>,
-    extern_tables: Tables<DefId>,
+pub struct CStore<'tcx> {
+    local_tables: UnordMap<CrateNum, Tables<'tcx, DefIndexKey>>,
+    extern_tables: Tables<'tcx, DefId>,
 }
 
 /// From CREUSOT: used to store the info about source files
@@ -89,10 +90,29 @@ impl EncodedSourceFileId {
 pub struct Footer {
     file_index_to_stable_id: FxHashMap<SourceFileIndex, EncodedSourceFileId>,
     syntax_contexts: FxHashMap<u32, AbsoluteBytePos>,
-    expn_data: FxHashMap<(StableCrateId, u32), AbsoluteBytePos>,
+    expn_data: FxHashMap<ExpnKey, AbsoluteBytePos>,
 }
+
+// Flux metadata is not encoded deterministically (i.e., `DETERMINISTIC_HASH_MAP_ENCODE` is false),
+// so the `ContextOrd` impls below never need to provide a stable comparator.
+
 #[derive(Encodable, Decodable, Eq, PartialEq, Hash, Clone, Copy, Debug)]
 struct SourceFileIndex(u32);
+
+impl<E> ContextOrd<E> for SourceFileIndex {}
+
+/// Identifies an expansion by the stable id of its crate and its crate-local index.
+#[derive(Encodable, Decodable, Eq, PartialEq, Hash, Clone, Copy, Debug)]
+struct ExpnKey(StableCrateId, u32);
+
+impl<E> ContextOrd<E> for ExpnKey {}
+
+/// Wrapper around [`DefIndex`] used to key the local tables. We need a local type to be able to
+/// implement [`ContextOrd`].
+#[derive(Encodable, Decodable, Eq, PartialEq, Hash, Clone, Copy, Debug)]
+struct DefIndexKey(DefIndex);
+
+impl<E> ContextOrd<E> for DefIndexKey {}
 
 #[derive(Encodable, Decodable, Clone, Copy)]
 pub struct AbsoluteBytePos(u64);
@@ -108,9 +128,9 @@ impl AbsoluteBytePos {
 }
 
 #[derive(Default, TyEncodable, TyDecodable)]
-pub struct CrateMetadata {
-    local_tables: Tables<DefIndex>,
-    extern_tables: Tables<DefId>,
+pub struct CrateMetadata<'tcx> {
+    local_tables: Tables<'tcx, DefIndexKey>,
+    extern_tables: Tables<'tcx, DefId>,
 }
 
 /// Trait to deal with the fact that `assoc_refinmenents_of` and `assoc_refinements_def` use
@@ -123,14 +143,14 @@ trait Key {
 }
 
 impl Key for DefId {
-    type KeyIndex = DefIndex;
+    type KeyIndex = DefIndexKey;
 
     fn crate_num(self) -> CrateNum {
         self.krate
     }
 
     fn to_index(self) -> Self::KeyIndex {
-        self.index
+        DefIndexKey(self.index)
     }
 
     fn name(self, tcx: TyCtxt) -> String {
@@ -139,14 +159,14 @@ impl Key for DefId {
 }
 
 impl Key for FluxDefId {
-    type KeyIndex = FluxId<DefIndex>;
+    type KeyIndex = FluxId<DefIndexKey>;
 
     fn crate_num(self) -> CrateNum {
         self.parent().krate
     }
 
     fn to_index(self) -> Self::KeyIndex {
-        self.index()
+        self.index().map_parent(DefIndexKey)
     }
 
     fn name(self, tcx: TyCtxt) -> String {
@@ -156,7 +176,7 @@ impl Key for FluxDefId {
 
 #[derive_where(Default)]
 #[derive(TyEncodable, TyDecodable)]
-pub struct Tables<K: Eq + Hash> {
+pub struct Tables<'tcx, K: Eq + Hash> {
     generics_of: UnordMap<K, QueryResult<rty::Generics>>,
     refinement_generics_of: UnordMap<K, QueryResult<rty::EarlyBinder<rty::RefinementGenerics>>>,
     predicates_of: UnordMap<K, QueryResult<rty::EarlyBinder<rty::GenericPredicates>>>,
@@ -168,19 +188,25 @@ pub struct Tables<K: Eq + Hash> {
     sort_of_assoc_reft: UnordMap<FluxId<K>, QueryResult<rty::EarlyBinder<rty::FuncSort>>>,
     fn_sig: UnordMap<K, QueryResult<rty::EarlyBinder<rty::PolyFnSig>>>,
     adt_def: UnordMap<K, QueryResult<rty::AdtDef>>,
+    invariants_of: UnordMap<K, rty::EarlyBinder<rty::List<rty::Invariant>>>,
     constant_info: UnordMap<K, QueryResult<rty::ConstantInfo>>,
+    static_info: UnordMap<K, QueryResult<rty::Ty>>,
     adt_sort_def: UnordMap<K, QueryResult<rty::AdtSortDef>>,
     variants_of: UnordMap<K, QueryResult<rty::Opaqueness<rty::EarlyBinder<rty::PolyVariants>>>>,
     type_of: UnordMap<K, QueryResult<rty::EarlyBinder<rty::TyOrCtor>>>,
-    normalized_defns: Rc<rty::NormalizedDefns>,
+    spec_funcs: Rc<rty::SpecFuncs>,
+    flux_module_children: UnordMap<K, Vec<fhir::FluxModChild>>,
     func_sort: UnordMap<FluxId<K>, rty::PolyFuncSort>,
     func_span: UnordMap<FluxId<K>, Span>,
     sort_decl_param_count: UnordMap<FluxId<K>, usize>,
     no_panic: UnordMap<K, bool>,
+    assume_parametric_params: UnordMap<K, UnordSet<u32>>,
+    spec_attr_span: UnordMap<K, Span>,
+    no_panic_specs: UnordMap<NodeKey<'tcx>, PanicSpec>,
 }
 
-impl CStore {
-    pub fn load(tcx: TyCtxt, sess: &FluxSession) -> Self {
+impl<'tcx> CStore<'tcx> {
+    pub fn load(tcx: TyCtxt<'tcx>, sess: &FluxSession) -> Self {
         let mut cstore = CStore::default();
         for crate_num in tcx.used_crates(()) {
             let Some(path) = flux_metadata_extern_location(tcx, *crate_num) else { continue };
@@ -195,7 +221,7 @@ impl CStore {
         &mut self,
         tcx: TyCtxt,
         sess: &FluxSession,
-        extern_tables: Tables<DefId>,
+        extern_tables: Tables<'tcx, DefId>,
     ) {
         macro_rules! merge_extern_table {
             ($self:expr, $tcx:expr, $table:ident, $extern_tables:expr) => {{
@@ -222,10 +248,14 @@ impl CStore {
         merge_extern_table!(self, tcx, sort_of_assoc_reft, extern_tables);
         merge_extern_table!(self, tcx, fn_sig, extern_tables);
         merge_extern_table!(self, tcx, adt_def, extern_tables);
+        merge_extern_table!(self, tcx, invariants_of, extern_tables);
         merge_extern_table!(self, tcx, adt_sort_def, extern_tables);
         merge_extern_table!(self, tcx, variants_of, extern_tables);
         merge_extern_table!(self, tcx, type_of, extern_tables);
         merge_extern_table!(self, tcx, no_panic, extern_tables);
+        merge_extern_table!(self, tcx, assume_parametric_params, extern_tables);
+        merge_extern_table!(self, tcx, spec_attr_span, extern_tables);
+        merge_extern_table!(self, tcx, static_info, extern_tables);
     }
 }
 
@@ -241,7 +271,20 @@ macro_rules! get {
     }};
 }
 
-impl CrateStore for CStore {
+/// Same as `get!` but returns a reference into the tables instead of cloning
+macro_rules! get_ref {
+    ($self:expr, $table:ident, $key:expr) => {{
+        let key = $key;
+        let this = $self;
+        if let Some(tables) = this.local_tables.get(&key.crate_num()) {
+            tables.$table.get(&key.to_index())
+        } else {
+            this.extern_tables.$table.get(&key)
+        }
+    }};
+}
+
+impl<'tcx> CrateStore<'tcx> for CStore<'tcx> {
     fn fn_sig(&self, def_id: DefId) -> OptResult<rty::EarlyBinder<rty::PolyFnSig>> {
         get!(self, fn_sig, def_id)
     }
@@ -250,12 +293,20 @@ impl CrateStore for CStore {
         get!(self, adt_def, def_id)
     }
 
+    fn invariants_of(&self, def_id: DefId) -> Option<rty::EarlyBinder<rty::List<rty::Invariant>>> {
+        get!(self, invariants_of, def_id)
+    }
+
     fn adt_sort_def(&self, def_id: DefId) -> OptResult<rty::AdtSortDef> {
         get!(self, adt_sort_def, def_id)
     }
 
     fn no_panic(&self, def_id: DefId) -> Option<bool> {
         get!(self, no_panic, def_id)
+    }
+
+    fn assume_parametric_params(&self, def_id: DefId) -> Option<UnordSet<u32>> {
+        get!(self, assume_parametric_params, def_id)
     }
 
     fn variants_of(
@@ -311,8 +362,32 @@ impl CrateStore for CStore {
         get!(self, constant_info, key)
     }
 
-    fn normalized_defns(&self, krate: CrateNum) -> std::rc::Rc<rty::NormalizedDefns> {
-        self.local_tables[&krate].normalized_defns.clone()
+    fn static_info(&self, key: DefId) -> OptResult<rty::Ty> {
+        get!(self, static_info, key)
+    }
+
+    fn spec_funcs(&self, krate: CrateNum) -> std::rc::Rc<rty::SpecFuncs> {
+        self.local_tables[&krate].spec_funcs.clone()
+    }
+
+    fn flux_module_children(&self, def_id: DefId) -> Option<&[fhir::FluxModChild]> {
+        get_ref!(self, flux_module_children, def_id).map(Vec::as_slice)
+    }
+
+    fn inferred_no_panic(&self, krate: CrateNum) -> Rc<UnordMap<NodeKey<'tcx>, PanicSpec>> {
+        // TODO: Some transitive deps (e.g. `hashbrown`) have no flux metadata. Return
+        // an empty map (conservative: MightPanic) until the proper fix is in place.
+        // See notes/hashbrown-inferred-no-panic.txt.
+        Rc::new(
+            self.local_tables
+                .get(&krate)
+                .map(|t| t.no_panic_specs.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    fn has_crate(&self, krate: CrateNum) -> bool {
+        self.local_tables.contains_key(&krate)
     }
 
     fn func_sort(&self, key: FluxDefId) -> Option<rty::PolyFuncSort> {
@@ -326,10 +401,18 @@ impl CrateStore for CStore {
     fn sort_decl_param_count(&self, key: FluxDefId) -> Option<usize> {
         get!(self, sort_decl_param_count, key)
     }
+
+    fn spec_attr_span(&self, def_id: DefId) -> Option<Span> {
+        get!(self, spec_attr_span, def_id)
+    }
 }
 
-impl CrateMetadata {
-    fn new(genv: GlobalEnv) -> Self {
+impl<'tcx> CrateMetadata<'tcx> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "we seed the call graph with non-dummy local def ids, so the traversal should never reach dummy extern spec items."
+    )]
+    fn new(genv: GlobalEnv<'_, 'tcx>) -> Self {
         let mut local_tables = Tables::default();
         encode_def_ids(
             genv,
@@ -339,6 +422,16 @@ impl CrateMetadata {
             FluxDefId::to_index,
         );
         encode_flux_defs(genv, &mut local_tables);
+        // Serialize the `NodeKey`-keyed map filtered to nodes of locally-defined functions (source
+        // items + monomorphizations). Only `Item`-kind instances carry a meaningful spec; shims and
+        // other non-`Item` instances are `Leaf`/`MightPanic` and not worth storing. Downstream
+        // crates reconstruct these keys for exact/identity lookups (`inferred_no_panic_external`).
+        local_tables.no_panic_specs = genv
+            .inferred_no_panic_local()
+            .items()
+            .filter(|(key, _)| key.is_local_item())
+            .map(|(key, spec)| (*key, *spec))
+            .collect();
 
         let mut extern_tables = Tables::default();
         encode_def_ids(
@@ -353,33 +446,53 @@ impl CrateMetadata {
     }
 }
 
-fn encode_flux_defs(genv: GlobalEnv, tables: &mut Tables<DefIndex>) {
-    tables.normalized_defns = genv.normalized_defns(LOCAL_CRATE);
+fn encode_flux_defs<'tcx>(genv: GlobalEnv<'_, 'tcx>, tables: &mut Tables<'tcx, DefIndexKey>) {
+    tables.spec_funcs = genv.spec_funcs(LOCAL_CRATE);
 
+    encode_flux_module_children(genv, tables);
     for (def_id, item) in genv.fhir_iter_flux_items() {
         match item {
             fhir::FluxItem::Func(spec_func) => {
-                tables
-                    .func_sort
-                    .insert(def_id.local_def_index(), genv.func_sort(def_id));
+                tables.func_sort.insert(
+                    def_id.local_def_index().map_parent(DefIndexKey),
+                    genv.func_sort(def_id),
+                );
                 tables
                     .func_span
-                    .insert(def_id.local_def_index(), spec_func.ident_span);
+                    .insert(def_id.local_def_index().map_parent(DefIndexKey), spec_func.ident_span);
             }
             fhir::FluxItem::SortDecl(_sort_decl) => {
-                tables
-                    .sort_decl_param_count
-                    .insert(def_id.local_def_index(), genv.sort_decl_param_count(def_id));
+                tables.sort_decl_param_count.insert(
+                    def_id.local_def_index().map_parent(DefIndexKey),
+                    genv.sort_decl_param_count(def_id),
+                );
             }
-            fhir::FluxItem::PrimOpProp(_) | fhir::FluxItem::Qualifier(_) => {}
+            fhir::FluxItem::PrimOpProp(_)
+            | fhir::FluxItem::Axiom(_)
+            | fhir::FluxItem::Qualifier(_) => {}
         }
     }
 }
 
-fn encode_def_ids<K: Eq + Hash + Copy>(
-    genv: GlobalEnv,
+fn encode_flux_module_children<'tcx>(
+    genv: GlobalEnv<'_, 'tcx>,
+    tables: &mut Tables<'tcx, DefIndexKey>,
+) {
+    genv.tcx().hir_for_each_module(|module| {
+        let module = module.to_local_def_id();
+        let children = genv.flux_module_children(module.to_def_id());
+        if !children.is_empty() {
+            tables
+                .flux_module_children
+                .insert(DefIndexKey(module.local_def_index), children.to_vec());
+        }
+    });
+}
+
+fn encode_def_ids<'tcx, K: Eq + Hash + Copy>(
+    genv: GlobalEnv<'_, 'tcx>,
     def_ids: impl IntoIterator<Item = DefId>,
-    tables: &mut Tables<K>,
+    tables: &mut Tables<'tcx, K>,
     did_to_key: fn(DefId) -> K,
     assoc_id_to_key: fn(FluxDefId) -> FluxId<K>,
 ) {
@@ -389,87 +502,162 @@ fn encode_def_ids<K: Eq + Hash + Copy>(
 
         match def_kind {
             DefKind::Trait => {
-                tables.generics_of.insert(key, genv.generics_of(def_id));
-                tables.predicates_of.insert(key, genv.predicates_of(def_id));
                 tables
-                    .refinement_generics_of
-                    .insert(key, genv.refinement_generics_of(def_id));
-                let assocs = genv.assoc_refinements_of(def_id);
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables
+                    .predicates_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::predicates_of));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
+                let assocs = genv.run_query_if_reached(def_id, GlobalEnv::assoc_refinements_of);
                 if let Ok(assocs) = &assocs {
                     for assoc_reft in &assocs.items {
                         let def_id = assoc_reft.def_id();
                         let key = assoc_id_to_key(def_id);
-                        tables
-                            .default_assoc_refinements_def
-                            .insert(key, genv.default_assoc_refinement_body(def_id));
-                        tables
-                            .sort_of_assoc_reft
-                            .insert(key, genv.sort_of_assoc_reft(def_id));
+                        tables.default_assoc_refinements_def.insert(
+                            key,
+                            genv.run_query_if_reached(
+                                def_id,
+                                GlobalEnv::default_assoc_refinement_body,
+                            ),
+                        );
+                        tables.sort_of_assoc_reft.insert(
+                            key,
+                            genv.run_query_if_reached(def_id, GlobalEnv::sort_of_assoc_reft),
+                        );
                     }
                 }
                 tables.assoc_refinements_of.insert(key, assocs);
             }
             DefKind::Impl { of_trait } => {
-                tables.generics_of.insert(key, genv.generics_of(def_id));
-                tables.predicates_of.insert(key, genv.predicates_of(def_id));
                 tables
-                    .refinement_generics_of
-                    .insert(key, genv.refinement_generics_of(def_id));
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables
+                    .predicates_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::predicates_of));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
 
                 if of_trait {
-                    let assocs = genv.assoc_refinements_of(def_id);
+                    let assocs = genv.run_query_if_reached(def_id, GlobalEnv::assoc_refinements_of);
                     if let Ok(assocs) = &assocs {
                         for assoc_reft in &assocs.items {
                             let def_id = assoc_reft.def_id();
                             let key = assoc_id_to_key(def_id);
-                            tables
-                                .assoc_refinements_def
-                                .insert(key, genv.assoc_refinement_body(def_id));
-                            tables
-                                .sort_of_assoc_reft
-                                .insert(key, genv.sort_of_assoc_reft(def_id));
+                            tables.assoc_refinements_def.insert(
+                                key,
+                                genv.run_query_if_reached(def_id, GlobalEnv::assoc_refinement_body),
+                            );
+                            tables.sort_of_assoc_reft.insert(
+                                key,
+                                genv.run_query_if_reached(def_id, GlobalEnv::sort_of_assoc_reft),
+                            );
                         }
                     }
                     tables.assoc_refinements_of.insert(key, assocs);
                 }
             }
-            DefKind::Fn | DefKind::AssocFn | DefKind::Ctor(_, CtorKind::Fn) => {
-                tables.generics_of.insert(key, genv.generics_of(def_id));
-                tables.predicates_of.insert(key, genv.predicates_of(def_id));
+            DefKind::Fn | DefKind::AssocFn => {
                 tables
-                    .refinement_generics_of
-                    .insert(key, genv.refinement_generics_of(def_id));
-                tables.fn_sig.insert(key, genv.fn_sig(def_id));
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables
+                    .predicates_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::predicates_of));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
+                tables
+                    .fn_sig
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::fn_sig));
                 tables.no_panic.insert(key, genv.no_panic(def_id));
+                tables
+                    .assume_parametric_params
+                    .insert(key, genv.assume_parametric_params(def_id));
+                if let Some(span) = genv.spec_attr_span(def_id) {
+                    tables.spec_attr_span.insert(key, span);
+                }
+            }
+            DefKind::Ctor(_, CtorKind::Fn) => {
+                tables
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
+                tables
+                    .fn_sig
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::fn_sig));
             }
             DefKind::Enum | DefKind::Struct => {
-                tables.generics_of.insert(key, genv.generics_of(def_id));
-                tables.predicates_of.insert(key, genv.predicates_of(def_id));
                 tables
-                    .refinement_generics_of
-                    .insert(key, genv.refinement_generics_of(def_id));
-                tables.adt_def.insert(key, genv.adt_def(def_id));
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables
+                    .predicates_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::predicates_of));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
+                tables
+                    .adt_def
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::adt_def));
+                if let Ok(invariants) =
+                    genv.run_query_if_reached(def_id, |genv, def_id| Ok(genv.invariants_of(def_id)))
+                {
+                    tables.invariants_of.insert(key, invariants);
+                }
                 tables
                     .adt_sort_def
-                    .insert(key, genv.adt_sort_def_of(def_id));
-                tables.variants_of.insert(key, genv.variants_of(def_id));
-                tables.type_of.insert(key, genv.type_of(def_id));
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::adt_sort_def_of));
+                tables
+                    .variants_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::variants_of));
+                tables
+                    .type_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::type_of));
             }
             DefKind::TyAlias => {
-                tables.generics_of.insert(key, genv.generics_of(def_id));
-                tables.predicates_of.insert(key, genv.predicates_of(def_id));
                 tables
-                    .refinement_generics_of
-                    .insert(key, genv.refinement_generics_of(def_id));
-                tables.type_of.insert(key, genv.type_of(def_id));
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables
+                    .predicates_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::predicates_of));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
+                tables
+                    .type_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::type_of));
             }
             DefKind::OpaqueTy => {
-                tables.generics_of.insert(key, genv.generics_of(def_id));
-                tables.predicates_of.insert(key, genv.predicates_of(def_id));
-                tables.item_bounds.insert(key, genv.item_bounds(def_id));
                 tables
-                    .refinement_generics_of
-                    .insert(key, genv.refinement_generics_of(def_id));
+                    .generics_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::generics_of));
+                tables
+                    .predicates_of
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::predicates_of));
+                tables
+                    .item_bounds
+                    .insert(key, genv.run_query_if_reached(def_id, GlobalEnv::item_bounds));
+                tables.refinement_generics_of.insert(
+                    key,
+                    genv.run_query_if_reached(def_id, GlobalEnv::refinement_generics_of),
+                );
+            }
+            DefKind::Static { .. } => {
+                tables.static_info.insert(key, genv.static_info(def_id));
             }
             _ => {}
         }
@@ -489,7 +677,7 @@ fn flux_metadata_extern_location(tcx: TyCtxt, crate_num: CrateNum) -> Option<Pat
     tcx.used_crate_source(crate_num)
         .rmeta
         .as_ref()
-        .map(|(path, _)| path.with_extension("fluxmeta"))
+        .map(|path| path.with_extension("fluxmeta"))
 }
 
 // Tags for encoding Symbol's
@@ -505,7 +693,7 @@ mod errors {
     use crate::Key;
 
     #[derive(Diagnostic)]
-    #[diag(metadata_duplicate_spec, code = E0999)]
+    #[diag("duplicate spec for {$def_name}", code = E0999)]
     pub(super) struct DuplicateSpec {
         def_name: String,
     }

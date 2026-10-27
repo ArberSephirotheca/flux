@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use rustc_macros::{Decodable, Encodable};
 
@@ -10,10 +10,27 @@ use rustc_macros::{Decodable, Encodable};
 /// because we never do arithmetic. We can change the representation in the future (and use arbitrary
 /// precision integers) if this ever becomes a problem, e.g., if we want to do (precise) arithmetic
 /// during constant folding.
-#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Encodable, Decodable, PartialOrd, Ord)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Hash, Encodable, Decodable)]
 pub struct BigInt {
     sign: Sign,
     val: u128,
+}
+
+impl PartialOrd for BigInt {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BigInt {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.sign, other.sign) {
+            (Sign::Negative, Sign::NonNegative) => Ordering::Less,
+            (Sign::NonNegative, Sign::Negative) => Ordering::Greater,
+            (Sign::NonNegative, Sign::NonNegative) => self.val.cmp(&other.val),
+            (Sign::Negative, Sign::Negative) => other.val.cmp(&self.val),
+        }
+    }
 }
 
 /// This are in order so negative is less than non-negative.
@@ -51,6 +68,71 @@ impl BigInt {
     /// unsigned integer for that type, i.e., 2^bit_width - 1.
     pub fn uint_max(bit_width: u32) -> BigInt {
         (u128::MAX >> (128 - bit_width)).into()
+    }
+
+    pub fn neg(&self) -> Self {
+        if self.val == 0 {
+            Self::ZERO // Avoid negative zero
+        } else {
+            Self {
+                sign: match self.sign {
+                    Sign::Negative => Sign::NonNegative,
+                    Sign::NonNegative => Sign::Negative,
+                },
+                val: self.val,
+            }
+        }
+    }
+
+    pub fn checked_add(&self, other: &Self) -> Option<Self> {
+        if self.sign == other.sign {
+            Some(Self { sign: self.sign, val: self.val.checked_add(other.val)? })
+        } else if self.val >= other.val {
+            let val = self.val - other.val;
+            if val == 0 { Some(Self::ZERO) } else { Some(Self { sign: self.sign, val }) }
+        } else {
+            Some(Self { sign: other.sign, val: other.val - self.val })
+        }
+    }
+
+    pub fn checked_sub(&self, other: &Self) -> Option<Self> {
+        self.checked_add(&other.neg())
+    }
+
+    pub fn checked_mul(&self, other: &Self) -> Option<Self> {
+        let val = self.val.checked_mul(other.val)?;
+        if val == 0 {
+            Some(Self::ZERO)
+        } else {
+            let sign = if self.sign == other.sign { Sign::NonNegative } else { Sign::Negative };
+            Some(Self { sign, val })
+        }
+    }
+
+    pub fn checked_div(&self, other: &Self) -> Option<Self> {
+        if other.val == 0 {
+            return None;
+        } // Divide by zero
+        let val = self.val / other.val;
+        if val == 0 {
+            Some(Self::ZERO)
+        } else {
+            let sign = if self.sign == other.sign { Sign::NonNegative } else { Sign::Negative };
+            Some(Self { sign, val })
+        }
+    }
+
+    pub fn checked_rem(&self, other: &Self) -> Option<Self> {
+        if other.val == 0 {
+            return None;
+        } // Divide by zero
+        let val = self.val % other.val;
+        if val == 0 {
+            Some(Self::ZERO)
+        } else {
+            // In Rust modulo, the remainder takes the sign of the dividend (self)
+            Some(Self { sign: self.sign, val })
+        }
     }
 }
 

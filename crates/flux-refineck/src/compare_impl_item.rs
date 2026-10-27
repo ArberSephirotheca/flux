@@ -10,16 +10,16 @@ use flux_middle::{
     queries::QueryResult,
     rty::TraitRef,
 };
-use rustc_hash::FxHashSet;
+use rustc_data_structures::unord::UnordSet;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::TypingMode;
 
 pub fn check_impl_against_trait(genv: GlobalEnv, impl_id: MaybeExternId) -> QueryResult {
-    let trait_id = genv.tcx().trait_id_of_impl(impl_id.resolved_id()).unwrap();
+    let trait_id = genv.tcx().impl_trait_id(impl_id.resolved_id());
 
     let impl_assoc_refts = genv.assoc_refinements_of(impl_id)?;
     let trait_assoc_refts = genv.assoc_refinements_of(trait_id)?;
-    let impl_names: FxHashSet<_> = impl_assoc_refts.items.iter().map(|x| x.name()).collect();
+    let impl_names: UnordSet<_> = impl_assoc_refts.items.iter().map(|x| x.name()).collect();
 
     for trait_assoc_reft in &trait_assoc_refts.items {
         let trait_assoc_def_id = trait_assoc_reft.def_id();
@@ -37,7 +37,6 @@ pub fn check_impl_against_trait(genv: GlobalEnv, impl_id: MaybeExternId) -> Quer
 
     let impl_trait_ref = genv
         .impl_trait_ref(impl_id.resolved_id())?
-        .unwrap()
         .instantiate_identity();
 
     let rustc_infcx = genv
@@ -124,10 +123,10 @@ pub(crate) mod errors {
     use rustc_span::{Span, Symbol};
 
     #[derive(Diagnostic)]
-    #[diag(refineck_incompatible_sort, code = E0999)]
+    #[diag("implemented associated refinement `{$name}` has an incompatible sort for trait", code = E0999)]
     pub(super) struct IncompatibleSort {
         #[primary_span]
-        #[label]
+        #[label("expected `{$expected}`, found `{$found}`")]
         span: Span,
         name: Symbol,
         expected: rty::FuncSort,
@@ -146,7 +145,7 @@ pub(crate) mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_missing_assoc_reft, code = E0999)]
+    #[diag("associated refinement `{$name}` is missing from implementation", code = E0999)]
     pub struct MissingAssocReft {
         #[primary_span]
         span: Span,
@@ -160,7 +159,7 @@ pub(crate) mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_impl_assoc_reft_final, code = E0999)]
+    #[diag("associated refinement `{$name}` is final and should not be implemented anywhere other than the trait definition", code = E0999)]
     pub struct ImplAssocReftOnFinal {
         #[primary_span]
         span: Span,
@@ -174,7 +173,7 @@ pub(crate) mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(refineck_invalid_assoc_reft, code = E0999)]
+    #[diag("associated refinement `{$name}` is not a member of trait `{$trait_}`", code = E0999)]
     pub struct InvalidAssocReft {
         #[primary_span]
         span: Span,

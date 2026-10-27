@@ -15,12 +15,12 @@ use rustc_data_structures::unord::UnordMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{def::DefKind, def_id::LocalDefId};
 use rustc_middle::{
-    mir::{Location, Promoted, START_BLOCK},
+    mir::{BorrowKind, Location, Promoted, START_BLOCK},
     ty::TyCtxt,
 };
 
-type LocationMap = FxHashMap<Location, Vec<GhostStatement>>;
-type EdgeMap = FxHashMap<BasicBlock, FxHashMap<BasicBlock, Vec<GhostStatement>>>;
+type LocationMap = UnordMap<Location, Vec<GhostStatement>>;
+type EdgeMap = UnordMap<BasicBlock, FxHashMap<BasicBlock, Vec<GhostStatement>>>;
 
 /// A type to indicate _who_ the ghost statements are for: either a regular `DefId` (including closures)  a promoted body.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -100,15 +100,18 @@ impl GhostStatements {
                 at_edge: EdgeMap::default(),
             };
 
-            // We have fn_sig for function items, but not for closures or generators or promoteds.
-            let fn_sig = if genv.def_kind(def_id) == DefKind::Closure || checker_id.is_promoted() {
-                None
-            } else {
-                Some(genv.fn_sig(def_id)?)
-            };
+            // We have fn_sig for function items, but not for closures, generators, statics, or promoteds.
+            let fn_sig =
+                if matches!(genv.def_kind(def_id), DefKind::Closure | DefKind::Static { .. })
+                    || checker_id.is_promoted()
+                {
+                    None
+                } else {
+                    Some(genv.fn_sig(def_id)?)
+                };
 
             fold_unfold::add_ghost_statements(&mut stmts, genv, body, fn_sig.as_ref())?;
-            points_to::add_ghost_statements(&mut stmts, genv, &body.rustc_body, fn_sig.as_ref())?;
+            points_to::add_ghost_statements(&mut stmts, genv, body.rustc_body(), fn_sig.as_ref())?;
             // We only add unblock statements for the main body because borrows in promoted constants
             // have to be live in the main body so they never go out of scope in the promoted body.
             if !checker_id.is_promoted() {
@@ -122,11 +125,22 @@ impl GhostStatements {
 
     fn add_unblocks<'tcx>(&mut self, tcx: TyCtxt<'tcx>, body_root: &BodyRoot<'tcx>) {
         for (location, borrows) in body_root.calculate_borrows_out_of_scope_at_location() {
-            let stmts = borrows.into_iter().map(|bidx| {
-                let borrow = body_root.borrow_data(bidx);
-                let place = lowering::lower_place(tcx, &borrow.borrowed_place()).unwrap();
-                GhostStatement::Unblock(place)
-            });
+            let stmts = borrows
+                .into_iter()
+                .filter(|bidx| {
+                    // Only mutable borrows of owned places ever block the place (via the
+                    // `ptr(mut, ℓ)` → `&mut` conversion in `TypeEnv::ptr_to_ref`). Shared and
+                    // fake borrows never block, so emitting an `Unblock` for them is at best a
+                    // no-op and at worst an ICE: the borrowed place may have been folded back to
+                    // a struct (e.g. `&s` live alongside `&s.b`), which `PlacesTree::unblock`
+                    // cannot traverse.
+                    matches!(body_root.borrow_data(*bidx).kind(), BorrowKind::Mut { .. })
+                })
+                .map(|bidx| {
+                    let borrow = body_root.borrow_data(bidx);
+                    let place = lowering::lower_place(tcx, &borrow.borrowed_place()).unwrap();
+                    GhostStatement::Unblock(place)
+                });
             self.at_location.entry(location).or_default().extend(stmts);
         }
     }
@@ -176,7 +190,7 @@ impl GhostStatements {
 
     pub(crate) fn dump_ghost_mir<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) {
         use rustc_middle::mir::{PassWhere, pretty::MirDumper};
-        if let Some(dumper) = MirDumper::new(tcx, "ghost", &body.rustc_body) {
+        if let Some(dumper) = MirDumper::new(tcx, "ghost", body.rustc_body()) {
             dumper
                 .set_extra_data(&|pass, w| {
                     match pass {
@@ -207,7 +221,7 @@ impl GhostStatements {
                     }
                     Ok(())
                 })
-                .dump_mir(&body.rustc_body);
+                .dump_mir(body.rustc_body());
         }
     }
 }
@@ -258,7 +272,7 @@ fn all_nested_bodies(tcx: TyCtxt, def_id: LocalDefId) -> impl Iterator<Item = Lo
             hir::intravisit::walk_expr(self, ex);
         }
     }
-    let body = tcx.hir_body_owned_by(def_id).value;
+    let body = &tcx.hir_body_owned_by(def_id).value;
     let mut finder = ClosureFinder { tcx, closures: FxHashSet::default() };
     hir::intravisit::Visitor::visit_expr(&mut finder, body);
     finder.closures.into_iter().chain(iter::once(def_id))

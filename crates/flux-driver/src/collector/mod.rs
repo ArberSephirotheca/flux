@@ -7,22 +7,26 @@ use std::{collections::HashMap, iter};
 use annot_stats::Stats;
 use extern_specs::ExternSpecCollector;
 use flux_common::{
+    bug,
     iter::IterExt,
     result::{ErrorCollector, ResultExt},
     tracked_span_assert_eq,
 };
-use flux_config::{self as config, OverflowMode, PartialInferOpts, SmtSolver};
+use flux_config::{
+    self as config, OverflowMode, PartialInferOpts, RawDerefMode, SmtSolver, UifOps,
+};
 use flux_errors::{Errors, FluxSession};
-use flux_middle::Specs;
+use flux_middle::{FluxItemDecl, Specs};
 use flux_syntax::{
     ParseResult, ParseSess,
     surface::{self, NodeId, Trusted},
 };
 use rustc_ast::{MetaItemInner, MetaItemKind, tokenstream::TokenStream};
+use rustc_attr_ir::Attribute;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::{
-    self as hir, Attribute, CRATE_OWNER_ID, EnumDef, ImplItemKind, Item, ItemKind, OwnerId,
+    self as hir, CRATE_OWNER_ID, EnumDef, ImplItemKind, Item, ItemKind, Mutability, OwnerId,
     VariantData,
     def::DefKind,
     def_id::{CRATE_DEF_ID, DefId, LocalDefId},
@@ -111,7 +115,12 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         match &item.kind {
             ItemKind::Fn { .. } => {
                 if attrs.has_attrs() {
-                    let fn_sig = attrs.fn_sig();
+                    let (fn_sig, attr_span) =
+                        if let Some((sig, span)) = attrs.fn_sig_with_attr_span() {
+                            (Some(sig), Some(span))
+                        } else {
+                            (None, None)
+                        };
                     self.check_fn_sig_name(owner_id, fn_sig.as_ref())?;
                     let node_id = self.next_node_id();
                     self.insert_item(
@@ -122,6 +131,10 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
                             node_id,
                         },
                     )?;
+                    if let Some(span) = attr_span {
+                        self.specs
+                            .set_spec_attr_span(owner_id.def_id.to_def_id(), span);
+                    }
                 }
             }
             ItemKind::Struct(_, _, variant) => {
@@ -138,21 +151,32 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
             ItemKind::Mod(..) => self.collect_mod(owner_id, attrs)?,
             ItemKind::TyAlias(..) => self.collect_type_alias(owner_id, attrs)?,
             ItemKind::Impl(..) => self.collect_impl(owner_id, attrs)?,
-            ItemKind::Trait(..) => self.collect_trait(owner_id, attrs)?,
-            ItemKind::Const(.., body_id) => {
+            ItemKind::Trait { .. } => self.collect_trait(owner_id, attrs)?,
+            ItemKind::Const(.., rhs) => {
                 // The flux-rs macro puts defs as an outer attribute on a `const _: () = { }`. We
-                // consider these defs to be defined in the parent of the const.
+                // consider these defs to be in scope in the module or block containing the const,
+                // and declared by the const, which gives them their identity.
                 self.specs
-                    .flux_items_by_parent
-                    .entry(self.tcx.hir_get_parent_item(item.hir_id()))
+                    .flux_items_by_scope
+                    .entry(self.enclosing_scope(item.hir_id()))
                     .or_default()
-                    .extend(attrs.items());
+                    .extend(
+                        attrs
+                            .items()
+                            .into_iter()
+                            .map(|item| FluxItemDecl { declarer: owner_id, item }),
+                    );
 
-                if attrs.extern_spec() {
+                if attrs.extern_spec()
+                    && let hir::ConstItemRhs::Body(body_id) = rhs
+                {
                     return ExternSpecCollector::collect(self, *body_id);
                 }
 
                 self.collect_constant(owner_id, attrs)?;
+            }
+            ItemKind::Static(mutbl, ..) => {
+                self.collect_static(owner_id, mutbl, attrs)?;
             }
             _ => {}
         }
@@ -167,13 +191,21 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         if let rustc_hir::TraitItemKind::Fn(_, _) = trait_item.kind
             && attrs.has_attrs()
         {
-            let sig = attrs.fn_sig();
+            let (sig, attr_span) = if let Some((sig, span)) = attrs.fn_sig_with_attr_span() {
+                (Some(sig), Some(span))
+            } else {
+                (None, None)
+            };
             self.check_fn_sig_name(owner_id, sig.as_ref())?;
             let node_id = self.next_node_id();
             self.insert_trait_item(
                 owner_id,
                 surface::TraitItemFn { attrs: attrs.into_attr_vec(), sig, node_id },
             )?;
+            if let Some(span) = attr_span {
+                self.specs
+                    .set_spec_attr_span(owner_id.def_id.to_def_id(), span);
+            }
         }
         hir::intravisit::walk_trait_item(self, trait_item);
         Ok(())
@@ -187,24 +219,49 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         if let ImplItemKind::Fn(..) = &impl_item.kind
             && attrs.has_attrs()
         {
-            let sig = attrs.fn_sig();
+            let (sig, attr_span) = if let Some((sig, span)) = attrs.fn_sig_with_attr_span() {
+                (Some(sig), Some(span))
+            } else {
+                (None, None)
+            };
             self.check_fn_sig_name(owner_id, sig.as_ref())?;
             let node_id = self.next_node_id();
             self.insert_impl_item(
                 owner_id,
                 surface::ImplItemFn { attrs: attrs.into_attr_vec(), sig, node_id },
             )?;
+            if let Some(span) = attr_span {
+                self.specs
+                    .set_spec_attr_span(owner_id.def_id.to_def_id(), span);
+            }
         }
         hir::intravisit::walk_impl_item(self, impl_item);
         Ok(())
     }
 
+    /// The scope an item is declared in: the block containing it, or its module if it's a module
+    /// item. The parent of an item in a block is the [`hir::Stmt`] holding it, whose parent is the
+    /// block.
+    fn enclosing_scope(&self, item_id: hir::HirId) -> hir::HirId {
+        let parent = self.tcx.parent_hir_id(item_id);
+        match self.tcx.hir_node(parent) {
+            hir::Node::Stmt(_) => self.tcx.parent_hir_id(parent),
+            hir::Node::Item(Item { kind: ItemKind::Mod(..), .. }) | hir::Node::Crate(_) => parent,
+            node => bug!("unexpected parent of item: {node:?}"),
+        }
+    }
+
     fn collect_mod(&mut self, module_id: OwnerId, mut attrs: FluxAttrs) -> Result {
         self.specs
-            .flux_items_by_parent
-            .entry(module_id)
+            .flux_items_by_scope
+            .entry(hir::HirId::make_owner(module_id.def_id))
             .or_default()
-            .extend(attrs.items());
+            .extend(
+                attrs
+                    .items()
+                    .into_iter()
+                    .map(|item| FluxItemDecl { declarer: module_id, item }),
+            );
 
         if attrs.has_attrs() {
             let node_id = self.next_node_id();
@@ -325,6 +382,31 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         )
     }
 
+    fn parse_static_spec(
+        &mut self,
+        owner_id: OwnerId,
+        mutbl: &Mutability,
+        mut attrs: FluxAttrs,
+    ) -> Result {
+        if let Some(static_info) = attrs.static_spec() {
+            if matches!(mutbl, Mutability::Mut) {
+                return Err(self
+                    .errors
+                    .emit(errors::MutableStaticSpec::new(static_info.ty.span)));
+            };
+            let node_id = self.next_node_id();
+            self.insert_item(
+                owner_id,
+                surface::Item {
+                    attrs: attrs.into_attr_vec(),
+                    kind: surface::ItemKind::Static(static_info),
+                    node_id,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn parse_constant_spec(&mut self, owner_id: OwnerId, mut attrs: FluxAttrs) -> Result {
         if let Some(constant) = attrs.constant() {
             let node_id = self.next_node_id();
@@ -411,6 +493,15 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         self.parse_constant_spec(owner_id, attrs)
     }
 
+    fn collect_static(
+        &mut self,
+        owner_id: OwnerId,
+        mutbl: &Mutability,
+        attrs: FluxAttrs,
+    ) -> Result {
+        self.parse_static_spec(owner_id, mutbl, attrs)
+    }
+
     fn check_fn_sig_name(&mut self, owner_id: OwnerId, fn_sig: Option<&surface::FnSig>) -> Result {
         if let Some(fn_sig) = fn_sig
             && let Some(ident) = fn_sig.ident
@@ -458,12 +549,29 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
             .map(|attr_item| self.parse_flux_attr(attr_item, def_kind))
             .try_collect_exhaust()?;
 
+        // if there is a `no_panic_if` attribute, there must be a `sig` attribute as well.
+        if attrs
+            .iter()
+            .any(|attr| matches!(attr.kind, FluxAttrKind::NoPanicIf(_)))
+            && !attrs
+                .iter()
+                .any(|attr| matches!(attr.kind, FluxAttrKind::FnSig(_)))
+        {
+            let span = attrs
+                .iter()
+                .find_map(|attr| {
+                    if let FluxAttrKind::NoPanicIf(_) = attr.kind { Some(attr.span) } else { None }
+                })
+                .unwrap();
+            return Err(self.errors.emit(errors::NoPanicIfWithoutSig { span }));
+        }
+
         Ok(FluxAttrs::new(attrs))
     }
 
     fn parse_flux_attr(
         &mut self,
-        attr_item: &hir::AttrItem,
+        attr_item: &rustc_attr_ir::AttrItem,
         def_kind: DefKind,
     ) -> Result<FluxAttr> {
         let invalid_attr_err = |this: &Self| {
@@ -474,15 +582,19 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
         let [_, segment] = &attr_item.path.segments[..] else { return Err(invalid_attr_err(self)) };
 
         let kind = match (segment.as_str(), &attr_item.args) {
-            ("alias", hir::AttrArgs::Delimited(dargs)) => {
+            ("alias", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_type_alias, |t| {
                     FluxAttrKind::TypeAlias(Box::new(t))
                 })?
             }
-            ("sig" | "spec", hir::AttrArgs::Delimited(dargs)) => {
-                self.parse(dargs, ParseSess::parse_fn_sig, FluxAttrKind::FnSig)?
+            ("sig" | "spec", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
+                if matches!(def_kind, DefKind::Static { .. }) {
+                    self.parse(dargs, ParseSess::parse_static_info, FluxAttrKind::StaticSpec)?
+                } else {
+                    self.parse(dargs, ParseSess::parse_fn_sig, FluxAttrKind::FnSig)?
+                }
             }
-            ("assoc" | "reft", hir::AttrArgs::Delimited(dargs)) => {
+            ("assoc" | "reft", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 match def_kind {
                     DefKind::Trait => {
                         self.parse(
@@ -501,50 +613,58 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
                     _ => return Err(invalid_attr_err(self)),
                 }
             }
-            ("qualifiers", hir::AttrArgs::Delimited(dargs)) => {
+            ("qualifiers", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_ident_list, FluxAttrKind::QualNames)?
             }
-            ("reveal", hir::AttrArgs::Delimited(dargs)) => {
+            ("reveal", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_ident_list, FluxAttrKind::RevealNames)?
             }
-            ("defs", hir::AttrArgs::Delimited(dargs)) => {
+            ("hide", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
+                self.parse(dargs, ParseSess::parse_ident_list, FluxAttrKind::HideNames)?
+            }
+            ("defs", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_flux_item, FluxAttrKind::Items)?
             }
-            ("refined_by", hir::AttrArgs::Delimited(dargs)) => {
+            ("refined_by", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_refined_by, FluxAttrKind::RefinedBy)?
             }
-            ("field", hir::AttrArgs::Delimited(dargs)) => {
+            ("field", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_type, FluxAttrKind::Field)?
             }
-            ("variant", hir::AttrArgs::Delimited(dargs)) => {
+            ("variant", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_variant, FluxAttrKind::Variant)?
             }
-            ("invariant", hir::AttrArgs::Delimited(dargs)) => {
+            ("invariant", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_expr, FluxAttrKind::Invariant)?
             }
-            ("constant", hir::AttrArgs::Delimited(dargs)) => {
+            ("no_panic_if", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
+                self.parse(dargs, ParseSess::parse_expr, FluxAttrKind::NoPanicIf)?
+            }
+            ("constant", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_constant_info, FluxAttrKind::Constant)?
             }
-            ("opts", hir::AttrArgs::Delimited(..)) => {
+            ("opts", rustc_attr_ir::AttrArgs::Delimited(..)) => {
                 let opts = AttrMap::parse(attr_item)
                     .emit(&self.errors)?
                     .try_into_infer_opts()
                     .emit(&self.errors)?;
                 FluxAttrKind::InferOpts(opts)
             }
-            ("ignore", hir::AttrArgs::Delimited(dargs)) => {
+            ("ignore", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_yes_or_no_with_reason, |b| {
                     FluxAttrKind::Ignore(b.into())
                 })?
             }
-            ("ignore", hir::AttrArgs::Empty) => FluxAttrKind::Ignore(surface::Ignored::Yes),
-            ("trusted", hir::AttrArgs::Delimited(dargs)) => {
+            ("ignore", rustc_attr_ir::AttrArgs::Empty) => {
+                FluxAttrKind::Ignore(surface::Ignored::Yes)
+            }
+            ("trusted", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_yes_or_no_with_reason, |b| {
                     FluxAttrKind::Trusted(b.into())
                 })?
             }
-            ("trusted", hir::AttrArgs::Empty) => FluxAttrKind::Trusted(Trusted::Yes),
-            ("trusted_impl", hir::AttrArgs::Delimited(dargs)) => {
+            ("trusted", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::Trusted(Trusted::Yes),
+            ("trusted_impl", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_yes_or_no_with_reason, |b| {
                     FluxAttrKind::TrustedImpl(b.into())
                 })?
@@ -553,15 +673,30 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
                 let span = attr_item_inner_span(attr_item);
                 FluxAttrKind::ProvenExternally(span)
             }
-            ("trusted_impl", hir::AttrArgs::Empty) => FluxAttrKind::TrustedImpl(Trusted::Yes),
-            ("opaque", hir::AttrArgs::Empty) => FluxAttrKind::Opaque,
-            ("reflect", hir::AttrArgs::Empty) => FluxAttrKind::Reflect,
-            ("extern_spec", hir::AttrArgs::Empty) => FluxAttrKind::ExternSpec,
-            ("no_panic", hir::AttrArgs::Empty) => FluxAttrKind::NoPanic,
-            ("should_fail", hir::AttrArgs::Empty) => FluxAttrKind::ShouldFail,
-            ("specs", hir::AttrArgs::Delimited(dargs)) => {
+            ("trusted_impl", rustc_attr_ir::AttrArgs::Empty) => {
+                FluxAttrKind::TrustedImpl(Trusted::Yes)
+            }
+            ("trusted_derive", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
+                self.parse(dargs, ParseSess::parse_yes_or_no_with_reason, |b| {
+                    FluxAttrKind::TrustedDerive(b.into())
+                })?
+            }
+            ("trusted_derive", rustc_attr_ir::AttrArgs::Empty) => {
+                FluxAttrKind::TrustedDerive(Trusted::Yes)
+            }
+            ("opaque", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::Opaque,
+            ("reflect", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::Reflect,
+            ("extern_spec", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::ExternSpec,
+            ("no_panic", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::NoPanic,
+            ("assume_parametric", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
+                self.parse(dargs, ParseSess::parse_ident_list, FluxAttrKind::AssumeParametric)?
+            }
+            ("should_fail", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::ShouldFail,
+            ("no_suggestions", rustc_attr_ir::AttrArgs::Empty) => FluxAttrKind::NoSuggestions,
+            ("specs", rustc_attr_ir::AttrArgs::Delimited(dargs)) => {
                 self.parse(dargs, ParseSess::parse_detached_specs, FluxAttrKind::DetachedSpecs)?
             }
+
             _ => return Err(invalid_attr_err(self)),
         };
         if config::annots() {
@@ -585,6 +720,16 @@ impl<'a, 'tcx> SpecCollector<'a, 'tcx> {
 
     fn report_dups(&mut self, attrs: &FluxAttrs) -> Result {
         let mut err = None;
+
+        // look for a NoPanic and a NoPanicIf
+        let has_no_panic_if = attrs.has_no_panic_if();
+        if has_no_panic_if && let Some(no_panic_attr_span) = attrs.has_no_panic() {
+            err.collect(self.errors.emit(errors::DuplicatedAttr {
+                span: no_panic_attr_span,
+                name: "NoPanic and NoPanicIf",
+            }));
+        }
+
         for (name, dups) in attrs.dups() {
             for attr in dups {
                 if attr.allow_dups() {
@@ -648,6 +793,7 @@ struct FluxAttr {
 enum FluxAttrKind {
     Trusted(Trusted),
     TrustedImpl(Trusted),
+    TrustedDerive(Trusted),
     ProvenExternally(Span),
     Opaque,
     Reflect,
@@ -658,10 +804,12 @@ enum FluxAttrKind {
     Generics(surface::Generics),
     QualNames(Vec<Ident>),
     RevealNames(Vec<Ident>),
+    HideNames(Vec<Ident>),
     Items(Vec<surface::FluxItem>),
     TypeAlias(Box<surface::TyAlias>),
     Field(surface::Ty),
     Constant(surface::ConstantInfo),
+    StaticSpec(surface::StaticInfo),
     Variant(surface::VariantDef),
     InferOpts(config::PartialInferOpts),
     Invariant(surface::Expr),
@@ -669,6 +817,9 @@ enum FluxAttrKind {
     ShouldFail,
     ExternSpec,
     NoPanic,
+    NoPanicIf(surface::Expr),
+    AssumeParametric(Vec<Ident>),
+    NoSuggestions,
     /// See `detachXX.rs`
     DetachedSpecs(surface::DetachedSpecs),
 }
@@ -738,8 +889,19 @@ impl FluxAttrs {
         read_attrs!(self, Items).into_iter().flatten().collect()
     }
 
-    fn fn_sig(&mut self) -> Option<surface::FnSig> {
-        read_attr!(self, FnSig)
+    fn fn_sig_with_attr_span(&mut self) -> Option<(surface::FnSig, Span)> {
+        self.map
+            .swap_remove(attr_name!(FnSig))
+            .and_then(|mut attrs| {
+                attrs.pop().and_then(|attr| {
+                    if let FluxAttrKind::FnSig(mut sig) = attr.kind {
+                        sig.no_panic = read_attr!(self, NoPanicIf);
+                        Some((sig, attr.span))
+                    } else {
+                        None
+                    }
+                })
+            })
     }
 
     fn ty_alias(&mut self) -> Option<Box<surface::TyAlias>> {
@@ -752,6 +914,17 @@ impl FluxAttrs {
 
     fn generics(&mut self) -> Option<surface::Generics> {
         read_attr!(self, Generics)
+    }
+
+    fn has_no_panic(&self) -> Option<Span> {
+        self.map
+            .get(attr_name!(NoPanic))
+            .and_then(|attrs| attrs.first())
+            .map(|attr| attr.span)
+    }
+
+    fn has_no_panic_if(&self) -> bool {
+        read_flag!(self, NoPanicIf)
     }
 
     fn trait_assoc_refts(&mut self) -> Vec<surface::TraitAssocReft> {
@@ -770,6 +943,10 @@ impl FluxAttrs {
 
     fn field(&mut self) -> Option<surface::Ty> {
         read_attr!(self, Field)
+    }
+
+    fn static_spec(&mut self) -> Option<surface::StaticInfo> {
+        read_attr!(self, StaticSpec)
     }
 
     fn constant(&mut self) -> Option<surface::ConstantInfo> {
@@ -798,13 +975,17 @@ impl FluxAttrs {
             let attr = match attr.kind {
                 FluxAttrKind::Trusted(trusted) => surface::Attr::Trusted(trusted),
                 FluxAttrKind::TrustedImpl(trusted) => surface::Attr::TrustedImpl(trusted),
+                FluxAttrKind::TrustedDerive(trusted) => surface::Attr::TrustedDerive(trusted),
                 FluxAttrKind::ProvenExternally(span) => surface::Attr::ProvenExternally(span),
                 FluxAttrKind::QualNames(names) => surface::Attr::Qualifiers(names),
                 FluxAttrKind::RevealNames(names) => surface::Attr::Reveal(names),
+                FluxAttrKind::HideNames(names) => surface::Attr::Hide(names),
                 FluxAttrKind::InferOpts(opts) => surface::Attr::InferOpts(opts),
                 FluxAttrKind::Ignore(ignored) => surface::Attr::Ignore(ignored),
                 FluxAttrKind::ShouldFail => surface::Attr::ShouldFail,
                 FluxAttrKind::NoPanic => surface::Attr::NoPanic,
+                FluxAttrKind::AssumeParametric(names) => surface::Attr::AssumeParametric(names),
+                FluxAttrKind::NoSuggestions => surface::Attr::NoSuggestions,
                 FluxAttrKind::Opaque
                 | FluxAttrKind::Reflect
                 | FluxAttrKind::FnSig(_)
@@ -816,10 +997,12 @@ impl FluxAttrs {
                 | FluxAttrKind::TypeAlias(_)
                 | FluxAttrKind::Field(_)
                 | FluxAttrKind::Constant(_)
+                | FluxAttrKind::StaticSpec(_)
                 | FluxAttrKind::Variant(_)
                 | FluxAttrKind::Invariant(_)
                 | FluxAttrKind::ExternSpec
-                | FluxAttrKind::DetachedSpecs(_) => continue,
+                | FluxAttrKind::DetachedSpecs(_)
+                | FluxAttrKind::NoPanicIf(_) => continue,
             };
             attrs.push(attr);
         }
@@ -832,6 +1015,7 @@ impl FluxAttrKind {
         match self {
             FluxAttrKind::Trusted(_) => attr_name!(Trusted),
             FluxAttrKind::TrustedImpl(_) => attr_name!(TrustedImpl),
+            FluxAttrKind::TrustedDerive(_) => attr_name!(TrustedDerive),
             FluxAttrKind::ProvenExternally(_) => attr_name!(ProvenExternally),
             FluxAttrKind::Opaque => attr_name!(Opaque),
             FluxAttrKind::Reflect => attr_name!(Reflect),
@@ -843,8 +1027,10 @@ impl FluxAttrKind {
             FluxAttrKind::Items(_) => attr_name!(Items),
             FluxAttrKind::QualNames(_) => attr_name!(QualNames),
             FluxAttrKind::RevealNames(_) => attr_name!(RevealNames),
+            FluxAttrKind::HideNames(_) => attr_name!(HideNames),
             FluxAttrKind::Field(_) => attr_name!(Field),
             FluxAttrKind::Constant(_) => attr_name!(Constant),
+            FluxAttrKind::StaticSpec(_) => attr_name!(StaticSpec),
             FluxAttrKind::Variant(_) => attr_name!(Variant),
             FluxAttrKind::TypeAlias(_) => attr_name!(TypeAlias),
             FluxAttrKind::InferOpts(_) => attr_name!(InferOpts),
@@ -854,6 +1040,9 @@ impl FluxAttrKind {
             FluxAttrKind::ExternSpec => attr_name!(ExternSpec),
             FluxAttrKind::DetachedSpecs(_) => attr_name!(DetachedSpecs),
             FluxAttrKind::NoPanic => attr_name!(NoPanic),
+            FluxAttrKind::NoPanicIf(_) => attr_name!(NoPanicIf),
+            FluxAttrKind::AssumeParametric(_) => attr_name!(AssumeParametric),
+            FluxAttrKind::NoSuggestions => attr_name!(NoSuggestions),
         }
     }
 }
@@ -896,7 +1085,7 @@ macro_rules! try_read_setting {
 type AttrMapErr<T = ()> = std::result::Result<T, errors::AttrMapErr>;
 
 impl AttrMap {
-    fn parse(attr_item: &hir::AttrItem) -> AttrMapErr<Self> {
+    fn parse(attr_item: &rustc_attr_ir::AttrItem) -> AttrMapErr<Self> {
         let mut map = Self { map: HashMap::new() };
         let err = || {
             Err(errors::AttrMapErr {
@@ -904,7 +1093,7 @@ impl AttrMap {
                 message: "bad syntax".to_string(),
             })
         };
-        let hir::AttrArgs::Delimited(d) = &attr_item.args else { return err() };
+        let rustc_attr_ir::AttrArgs::Delimited(d) = &attr_item.args else { return err() };
         let Some(items) = MetaItemKind::list_from_tokens(d.tokens.clone()) else { return err() };
         for item in items {
             map.parse_entry(&item)?;
@@ -949,8 +1138,10 @@ impl AttrMap {
         let mut infer_opts = PartialInferOpts::default();
         try_read_setting!(self, allow_uninterpreted_cast, bool, infer_opts);
         try_read_setting!(self, check_overflow, OverflowMode, infer_opts);
+        try_read_setting!(self, allow_raw_deref, RawDerefMode, infer_opts);
         try_read_setting!(self, scrape_quals, bool, infer_opts);
         try_read_setting!(self, solver, SmtSolver, infer_opts);
+        try_read_setting!(self, uif_ops, UifOps, infer_opts);
 
         if let Some((name, setting)) = self.map.iter().next() {
             return Err(errors::AttrMapErr {
@@ -964,31 +1155,38 @@ impl AttrMap {
 }
 
 /// Returns the span of an attribute without `#[` and `]`
-fn attr_item_inner_span(attr_item: &hir::AttrItem) -> Span {
+fn attr_item_inner_span(attr_item: &rustc_attr_ir::AttrItem) -> Span {
     attr_args_span(&attr_item.args)
         .map_or(attr_item.path.span, |args_span| attr_item.path.span.to(args_span))
 }
 
-fn attr_args_span(attr_args: &hir::AttrArgs) -> Option<Span> {
+fn attr_args_span(attr_args: &rustc_attr_ir::AttrArgs) -> Option<Span> {
     match attr_args {
-        hir::AttrArgs::Empty => None,
-        hir::AttrArgs::Delimited(args) => Some(args.dspan.entire()),
-        hir::AttrArgs::Eq { eq_span, expr } => Some(eq_span.to(expr.span)),
+        rustc_attr_ir::AttrArgs::Empty => None,
+        rustc_attr_ir::AttrArgs::Delimited(args) => Some(args.dspan.entire()),
+        rustc_attr_ir::AttrArgs::Eq { eq_span, expr } => Some(eq_span.to(expr.span)),
     }
 }
 
 mod errors {
     use flux_errors::E0999;
-    use flux_macros::Diagnostic;
+    use flux_macros::{Diagnostic, msg};
     use flux_syntax::surface::ExprPath;
     use itertools::Itertools;
     use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level};
     use rustc_hir::def_id::DefId;
     use rustc_middle::ty::TyCtxt;
-    use rustc_span::{ErrorGuaranteed, Span, Symbol, symbol::Ident};
+    use rustc_span::{Span, Symbol, symbol::Ident};
 
     #[derive(Diagnostic)]
-    #[diag(driver_duplicated_attr, code = E0999)]
+    #[diag("`no_panic_if` attribute requires a `sig` annotation on the same item", code = E0999)]
+    pub(super) struct NoPanicIfWithoutSig {
+        #[primary_span]
+        pub span: Span,
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("duplicated attribute `{$name}`", code = E0999)]
     pub(super) struct DuplicatedAttr {
         #[primary_span]
         pub span: Span,
@@ -996,14 +1194,14 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_invalid_attr, code = E0999)]
+    #[diag("invalid flux attribute", code = E0999)]
     pub(super) struct InvalidAttr {
         #[primary_span]
         pub span: Span,
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_invalid_attr_map, code = E0999)]
+    #[diag("invalid attribute: {$message}", code = E0999)]
     pub(super) struct AttrMapErr {
         #[primary_span]
         pub span: Span,
@@ -1011,7 +1209,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_unresolved_specification, code = E0999)]
+    #[diag("unresolved {$thing} `{$ident}`", code = E0999)]
     pub(super) struct UnresolvedSpecification {
         #[primary_span]
         pub span: Span,
@@ -1031,7 +1229,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_multiple_specifications, code = E0999)]
+    #[diag("multiple specifications for `{$name}`", code = E0999)]
     pub(super) struct MultipleSpecifications {
         #[primary_span]
         pub span: Span,
@@ -1047,13 +1245,9 @@ mod errors {
     }
 
     impl<'sess> Diagnostic<'sess> for SyntaxErr {
-        fn into_diag(
-            self,
-            dcx: DiagCtxtHandle<'sess>,
-            level: Level,
-        ) -> Diag<'sess, ErrorGuaranteed> {
+        fn into_diag(self, dcx: DiagCtxtHandle<'sess>, level: Level) -> Diag<'sess> {
             use flux_syntax::ParseErrorKind;
-            let mut diag = Diag::new(dcx, level, crate::fluent_generated::driver_syntax_err);
+            let mut diag = Diag::new(dcx, level, msg!("syntax error"));
             diag.code(E0999).span(self.0.span).span_label(
                 self.0.span,
                 match &self.0.kind {
@@ -1091,11 +1285,24 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_attr_on_opaque, code = E0999)]
+    #[diag("specifications on mutable statics are not yet supported", code = E0999)]
+    pub(super) struct MutableStaticSpec {
+        #[primary_span]
+        span: Span,
+    }
+
+    impl MutableStaticSpec {
+        pub(super) fn new(span: Span) -> Self {
+            Self { span }
+        }
+    }
+
+    #[derive(Diagnostic)]
+    #[diag("opaque struct can't have refined fields", code = E0999)]
     pub(super) struct AttrOnOpaque {
         #[primary_span]
         span: Span,
-        #[label]
+        #[label("this field has a refinement type annotation")]
         field_span: Span,
     }
 
@@ -1107,10 +1314,10 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_reflected_enum_with_refined_by, code = E0999)]
+    #[diag("reflected enum with `refined_by` annotation", code = E0999)]
     pub(super) struct ReflectedEnumWithRefinedBy {
         #[primary_span]
-        #[label]
+        #[label("this enum can either be `reflected` or have a `refined_by` but not both")]
         span: Span,
     }
     impl ReflectedEnumWithRefinedBy {
@@ -1120,11 +1327,11 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_missing_variant, code = E0999)]
-    #[note]
+    #[diag("missing variant annotation", code = E0999)]
+    #[note("all variants in a refined enum must be annotated")]
     pub(super) struct MissingVariant {
         #[primary_span]
-        #[label]
+        #[label("this variant doesn't have a refinement annotation")]
         span: Span,
     }
 
@@ -1135,12 +1342,12 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(driver_mismatched_spec_name, code = E0999)]
+    #[diag("name in {$def_descr} spec doesn't match item's name", code = E0999)]
     pub(super) struct MismatchedSpecName {
         #[primary_span]
-        #[label]
+        #[label("must be `{$item_ident}`")]
         span: Span,
-        #[label(driver_item_def_ident)]
+        #[label("{$def_descr} defined here")]
         item_ident_span: Span,
         item_ident: Ident,
         def_descr: &'static str,

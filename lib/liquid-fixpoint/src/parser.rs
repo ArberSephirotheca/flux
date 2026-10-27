@@ -1,10 +1,11 @@
 use std::fmt;
 
-use indexmap::IndexMap;
 use itertools::Itertools;
+use rustc_data_structures::fx::FxIndexMap;
 
 use crate::{
     BinOp, BinRel, Bind, Constant, Expr, Identifier, Pred, Sort, SortCtor, ThyFunc, Types,
+    constraint::Quantifier,
     sexp::{Atom, ParseError as SexpParseError, Sexp},
 };
 
@@ -44,7 +45,7 @@ pub trait FromSexp<T: Types> {
 pub struct FromSexpWrapper<T: Types, Parser> {
     pub parser: Parser,
     pub _phantom: std::marker::PhantomData<T>,
-    scopes: Vec<IndexMap<String, T::Var>>,
+    scopes: Vec<FxIndexMap<String, T::Var>>,
 }
 
 type KvarSolution<T> = (Vec<(<T as Types>::Var, Sort<T>)>, Expr<T>);
@@ -84,8 +85,9 @@ where
                     Sexp::List(name_and_sort) => {
                         let name = self.parse_name(&name_and_sort[0])?;
                         let sort = self.parse_sort(&name_and_sort[1])?;
-                        let pred = self.parse_pred_inner(&items[1])?;
-                        Ok(Bind { name, sort, pred })
+                        let mut preds = vec![];
+                        self.parse_pred_inner(&items[1], &mut preds)?;
+                        Ok(Bind { name, sort, preds })
                     }
                     _ => Err(ParseError::err("Expected list for name and sort in bind")),
                 }
@@ -94,24 +96,30 @@ where
         }
     }
 
-    fn parse_pred_inner(&mut self, sexp: &Sexp) -> Result<Pred<T>, ParseError> {
+    fn parse_pred_inner(
+        &mut self,
+        sexp: &Sexp,
+        preds: &mut Vec<Pred<T>>,
+    ) -> Result<(), ParseError> {
         match sexp {
             Sexp::List(items) => {
                 match &items[0] {
                     Sexp::Atom(Atom::S(s)) if s == "and" => {
-                        items[1..]
-                            .to_vec()
-                            .iter()
-                            .map(|item| self.parse_pred_inner(item))
-                            .try_collect()
-                            .map(Pred::And)
+                        for item in &items[1..] {
+                            self.parse_pred_inner(item, preds)?;
+                        }
                     }
-                    Sexp::Atom(Atom::S(s)) if s.starts_with("$") => self.parse_kvar(sexp),
-                    _ => self.parse_expr_possibly_nested(sexp).map(Pred::Expr),
+                    Sexp::Atom(Atom::S(s)) if s.starts_with("$") => {
+                        preds.push(self.parse_kvar(sexp)?);
+                    }
+                    _ => {
+                        preds.push(Pred::Expr(self.parse_expr_possibly_nested(sexp)?));
+                    }
                 }
             }
-            _ => Err(ParseError::err("Expected list for pred")),
+            _ => Err(ParseError::err("Expected list for pred"))?,
         }
+        Ok(())
     }
 
     pub fn parse_kvar(&self, sexp: &Sexp) -> Result<Pred<T>, ParseError> {
@@ -153,17 +161,31 @@ where
         Ok(Expr::IsCtor(ctor, Box::new(arg)))
     }
 
+    fn parse_if(&mut self, sexp: &Sexp) -> Result<Expr<T>, ParseError> {
+        match sexp {
+            Sexp::List(items) => {
+                let condition = self.parse_expr_possibly_nested(&items[1])?;
+                let pos_val = self.parse_expr_possibly_nested(&items[2])?;
+                let neg_val = self.parse_expr_possibly_nested(&items[3])?;
+                Ok(Expr::IfThenElse(Box::new([condition, pos_val, neg_val])))
+            }
+            _ => Err(ParseError::err("Expected list for if-else")),
+        }
+    }
+
     pub fn parse_expr(&mut self, sexp: &Sexp) -> Result<Expr<T>, ParseError> {
         match sexp {
             Sexp::List(items) => {
                 if let Sexp::Atom(Atom::S(s)) = &items[0] {
                     match s.as_str() {
+                        "cast" => self.parse_expr(&items[1]),
                         "exists" => self.parse_exists(&items[1..]),
                         "let" => self.parse_let(sexp),
                         "not" => self.parse_not(sexp),
                         "or" => self.parse_or(sexp),
                         "and" => self.parse_and(sexp),
                         "lit" => parse_bitvec(sexp),
+                        "if" => self.parse_if(sexp),
                         "-" if items.len() == 2 => self.parse_neg(sexp),
                         "+" | "-" | "*" | "/" | "mod" => self.parse_binary_op(sexp),
                         "=" | "!=" | "<" | "<=" | ">" | ">=" => self.parse_atom(sexp),
@@ -188,7 +210,13 @@ where
             }
             Sexp::Atom(Atom::Q(s)) => Ok(Expr::Constant(Constant::String(self.parser.string(s)?))),
             Sexp::Atom(Atom::B(b)) => Ok(Expr::Constant(Constant::Boolean(*b))),
-            Sexp::Atom(Atom::I(i)) => Ok(Expr::Constant(Constant::Numeral(*i))),
+            Sexp::Atom(Atom::I(i)) => {
+                if *i >= 0 {
+                    Ok(Expr::Constant(Constant::Numeral(*i as u128)))
+                } else {
+                    Ok(Expr::Neg(Box::new(Expr::Constant(Constant::Numeral(-i as u128)))))
+                }
+            }
             Sexp::Atom(Atom::F(_f)) => {
                 unimplemented!("Float parsing not supported in fixpoint (see Constant::Real)")
             }
@@ -306,13 +334,29 @@ where
     fn parse_app(&mut self, sexp: &Sexp) -> Result<Expr<T>, ParseError> {
         match sexp {
             Sexp::List(items) => {
-                let exp1 = self.parse_expr_possibly_nested(&items[0])?;
-                let args: Vec<Expr<T>> = items[1..]
-                    .to_vec()
-                    .iter()
-                    .map(|sexp| self.parse_expr_possibly_nested(sexp))
-                    .try_collect()?;
-                Ok(Expr::App(Box::new(exp1), None, args))
+                let Sexp::List(inner) = &items[0] else {
+                    Err(ParseError::err("Expected list for inner func"))?
+                };
+                match &inner[1] {
+                    Sexp::Atom(Atom::S(s)) if s == "apply" => {
+                        let func_sort = self.parse_sort(&inner[2])?;
+                        let func = self.parse_expr_possibly_nested(&items[1])?;
+                        Ok(Expr::App(Box::new(func), None, vec![], Some(func_sort)))
+                    }
+                    _ => {
+                        let args: Vec<Expr<T>> = items[1..]
+                            .to_vec()
+                            .iter()
+                            .map(|sexp| self.parse_expr_possibly_nested(sexp))
+                            .try_collect()?;
+                        Ok(Expr::App(
+                            Box::new(self.parse_expr_possibly_nested(&items[0])?),
+                            None,
+                            args,
+                            None,
+                        ))
+                    }
+                }
             }
             _ => Err(ParseError::err("Expected list for app")),
         }
@@ -338,6 +382,7 @@ where
             _ => Err(ParseError::err("Expected list for binary operation")),
         }
     }
+
     fn parse_exists(&mut self, items: &[Sexp]) -> Result<Expr<T>, ParseError> {
         let [Sexp::List(var_sorts), body] = items else {
             return Err(ParseError::err("Expected list for vars and sorts in exists"));
@@ -367,7 +412,7 @@ where
             .zip(sorts)
             .map(|(name, sort)| (scope.swap_remove(name).unwrap(), sort))
             .collect();
-        Ok(Expr::Exists(bound, Box::new(body)))
+        Ok(Expr::Quantifier(Quantifier::Exists, bound, Box::new(body)))
     }
 
     fn parse_let(&mut self, sexp: &Sexp) -> Result<Expr<T>, ParseError> {
@@ -445,6 +490,11 @@ where
                     Ok(Sort::Str)
                 } else if s.starts_with("Size") {
                     self.parse_bv_size(sexp)
+                } else if let Some(idx_rparen) = s.strip_prefix("@(")
+                    && let Some(s_idx) = idx_rparen.strip_suffix(")")
+                    && let Ok(idx) = s_idx.parse::<usize>()
+                {
+                    Ok(Sort::Var(idx))
                 } else {
                     let ctor = SortCtor::Data(self.parser.sort(s)?);
                     Ok(Sort::App(ctor, vec![]))
@@ -496,7 +546,7 @@ where
                 .try_collect()?;
             self.push_scope(&kvar_args);
 
-            let expr = self.parse_expr(body)?;
+            let expr = self.parse_expr(body)?.uncurry();
 
             let mut scope = self.pop_scope().unwrap();
             let bound = kvar_args
@@ -520,7 +570,7 @@ where
         );
     }
 
-    fn pop_scope(&mut self) -> Option<IndexMap<String, T::Var>> {
+    fn pop_scope(&mut self) -> Option<FxIndexMap<String, T::Var>> {
         self.scopes.pop()
     }
 
@@ -600,6 +650,8 @@ fn parse_thy_func(name: &str) -> Option<ThyFunc> {
         "bv32_to_int" => Some(ThyFunc::Bv32ToInt),
         "int_to_bv64" => Some(ThyFunc::IntToBv64),
         "bv64_to_int" => Some(ThyFunc::Bv64ToInt),
+        "int_to_bv128" => Some(ThyFunc::IntToBv128),
+        "bv128_to_int" => Some(ThyFunc::Bv128ToInt),
 
         // BIT VECTORS - comparisons
         "bvule" => Some(ThyFunc::BvUle),
@@ -671,6 +723,7 @@ impl Types for StringTypes {
     type Var = String;
     type Tag = String;
     type String = String;
+    type Real = String;
 }
 
 impl FromSexp<StringTypes> for StringTypes {

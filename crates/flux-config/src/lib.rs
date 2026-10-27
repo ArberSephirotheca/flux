@@ -1,4 +1,3 @@
-#![feature(if_let_guard)]
 use globset::{Glob, GlobSet, GlobSetBuilder};
 pub use toml::Value;
 use tracing::Level;
@@ -10,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::LazyLock,
+    time::Duration,
 };
 
 use flags::FLAGS;
@@ -78,8 +78,24 @@ pub fn include_pattern() -> Option<&'static IncludePattern> {
     FLAGS.include.as_ref()
 }
 
+pub fn trusted_pattern() -> Option<&'static IncludePattern> {
+    FLAGS.include_trusted.as_ref()
+}
+
+pub fn trusted_impl_pattern() -> Option<&'static IncludePattern> {
+    FLAGS.include_trusted_impl.as_ref()
+}
+
 fn check_overflow() -> OverflowMode {
     FLAGS.check_overflow
+}
+
+fn uif_ops() -> UifOps {
+    FLAGS.uif_ops
+}
+
+fn allow_raw_deref() -> RawDerefMode {
+    FLAGS.allow_raw_deref
 }
 
 pub fn allow_uninterpreted_cast() -> bool {
@@ -94,8 +110,13 @@ pub fn no_panic() -> bool {
     FLAGS.no_panic
 }
 
-pub fn smt_define_fun() -> bool {
-    FLAGS.smt_define_fun
+pub fn sysroot() -> Option<PathBuf> {
+    if let Some(p) = FLAGS.sysroot.as_deref() {
+        Some(p.to_path_buf())
+    } else {
+        let exe = std::env::current_exe().ok()?;
+        exe.parent().map(|p| p.to_path_buf())
+    }
 }
 
 fn solver() -> SmtSolver {
@@ -124,6 +145,32 @@ pub fn summary() -> bool {
 
 pub fn full_compilation() -> bool {
     FLAGS.full_compilation
+}
+
+pub fn std_extern_specs() -> bool {
+    FLAGS.std_extern_specs
+}
+
+pub fn verbose() -> bool {
+    FLAGS.flux_verbose
+}
+
+pub fn suggestions() -> bool {
+    FLAGS.suggestions
+}
+
+pub fn rerun_hint() -> bool {
+    FLAGS.rerun_hint
+}
+
+pub fn fixpoint_timeout() -> Option<Duration> {
+    FLAGS.fixpoint_timeout.map(Duration::from_secs)
+}
+
+/// Whether the driver is running under `cargo flux` (which sets `FLUX_CARGO=1`), as opposed to a
+/// direct `flux`/`flux-driver` invocation. Used to decide whether to emit the re-run hint.
+pub fn inside_cargo() -> bool {
+    std::env::var_os("FLUX_CARGO").is_some()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -210,6 +257,14 @@ impl IncludePattern {
     }
 }
 
+impl FromStr for IncludePattern {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(vec![s.to_string()])
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Default)]
 #[serde(try_from = "String")]
 pub enum LeanMode {
@@ -226,7 +281,7 @@ impl LeanMode {
     const ERROR: &'static str = "expected one of `emit`, or `check`";
 
     pub fn is_emit(self) -> bool {
-        matches!(self, LeanMode::Emit | LeanMode::Check)
+        matches!(self, LeanMode::Emit)
     }
 
     pub fn is_check(self) -> bool {
@@ -263,6 +318,133 @@ impl fmt::Display for LeanMode {
             LeanMode::Emit => write!(f, "emit"),
             LeanMode::Check => write!(f, "check"),
         }
+    }
+}
+
+/// A binary operator that can be encoded as an uninterpreted function, see [`InferOpts::uif_ops`].
+/// These mirror the arithmetic and bitwise operators of the surface syntax.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UifOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitShl,
+    BitShr,
+}
+
+impl UifOp {
+    /// Maps the surface syntax (token) of each operator to the operator.
+    const TOKENS: [(&'static str, UifOp); 10] = [
+        ("+", UifOp::Add),
+        ("-", UifOp::Sub),
+        ("*", UifOp::Mul),
+        ("/", UifOp::Div),
+        ("%", UifOp::Mod),
+        ("&", UifOp::BitAnd),
+        ("|", UifOp::BitOr),
+        ("^", UifOp::BitXor),
+        ("<<", UifOp::BitShl),
+        (">>", UifOp::BitShr),
+    ];
+
+    /// The operator written as `token` in the surface syntax, if any
+    pub fn from_token(token: &str) -> Option<UifOp> {
+        Self::TOKENS
+            .iter()
+            .find_map(|(tok, op)| (*tok == token).then_some(*op))
+    }
+
+    /// The surface syntax of the operator
+    fn token(self) -> &'static str {
+        match self {
+            UifOp::Add => "+",
+            UifOp::Sub => "-",
+            UifOp::Mul => "*",
+            UifOp::Div => "/",
+            UifOp::Mod => "%",
+            UifOp::BitAnd => "&",
+            UifOp::BitOr => "|",
+            UifOp::BitXor => "^",
+            UifOp::BitShl => "<<",
+            UifOp::BitShr => ">>",
+        }
+    }
+
+    fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+}
+
+/// A set of [`UifOp`]s. It is a bitset so [`InferOpts`] can be `Copy`. It is written as a comma
+/// separated list of operators, e.g., `*,/,%`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "String")]
+pub struct UifOps(u16);
+
+impl UifOps {
+    const ERROR: &'static str =
+        "expected a comma separated list of `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<`, or `>>`";
+
+    pub fn contains(self, op: UifOp) -> bool {
+        self.0 & op.bit() != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn insert(&mut self, op: UifOp) {
+        self.0 |= op.bit();
+    }
+
+    fn iter(self) -> impl Iterator<Item = UifOp> {
+        UifOp::TOKENS
+            .into_iter()
+            .map(|(_, op)| op)
+            .filter(move |op| self.contains(*op))
+    }
+}
+
+impl FromStr for UifOps {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut ops = UifOps::default();
+        let tokens = s
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty());
+        for token in tokens {
+            let op = UifOp::from_token(token).ok_or(Self::ERROR)?;
+            ops.insert(op);
+        }
+        Ok(ops)
+    }
+}
+
+impl TryFrom<String> for UifOps {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for UifOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tokens: Vec<_> = self.iter().map(UifOp::token).collect();
+        write!(f, "{}", tokens.join(","))
+    }
+}
+
+impl fmt::Debug for UifOps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UifOps({self})")
     }
 }
 
@@ -322,6 +504,50 @@ impl fmt::Display for OverflowMode {
 
 #[derive(Clone, Copy, Debug, Deserialize, Default)]
 #[serde(try_from = "String")]
+pub enum RawDerefMode {
+    /// Don't allow raw pointer dereferences (default)
+    #[default]
+    None,
+    /// Allow raw pointer dereferences
+    Ok,
+}
+
+impl RawDerefMode {
+    const ERROR: &'static str = "expected one of `none` or `ok`";
+}
+
+impl FromStr for RawDerefMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "none" => Ok(RawDerefMode::None),
+            "ok" => Ok(RawDerefMode::Ok),
+            _ => Err(Self::ERROR),
+        }
+    }
+}
+
+impl TryFrom<String> for RawDerefMode {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for RawDerefMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RawDerefMode::None => write!(f, "none"),
+            RawDerefMode::Ok => write!(f, "ok"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default)]
+#[serde(try_from = "String")]
 pub enum SmtSolver {
     #[default]
     Z3,
@@ -373,6 +599,10 @@ pub struct InferOpts {
     pub solver: SmtSolver,
     /// Whether to allow uninterpreted casts (e.g., from some random `S` to `int`).
     pub allow_uninterpreted_cast: bool,
+    /// Whether to allow raw pointer dereferences.
+    pub allow_raw_deref: RawDerefMode,
+    /// Binary operators that are encoded as uninterpreted functions (e.g. to avoid nonlinear arithmetic).
+    pub uif_ops: UifOps,
 }
 
 impl From<PartialInferOpts> for InferOpts {
@@ -384,6 +614,8 @@ impl From<PartialInferOpts> for InferOpts {
             allow_uninterpreted_cast: opts
                 .allow_uninterpreted_cast
                 .unwrap_or_else(allow_uninterpreted_cast),
+            allow_raw_deref: opts.allow_raw_deref.unwrap_or_else(allow_raw_deref),
+            uif_ops: opts.uif_ops.unwrap_or_else(uif_ops),
         }
     }
 }
@@ -394,6 +626,8 @@ pub struct PartialInferOpts {
     pub scrape_quals: Option<bool>,
     pub solver: Option<SmtSolver>,
     pub allow_uninterpreted_cast: Option<bool>,
+    pub allow_raw_deref: Option<RawDerefMode>,
+    pub uif_ops: Option<UifOps>,
 }
 
 impl PartialInferOpts {
@@ -404,6 +638,8 @@ impl PartialInferOpts {
             .or(other.allow_uninterpreted_cast);
         self.scrape_quals = self.scrape_quals.or(other.scrape_quals);
         self.solver = self.solver.or(other.solver);
+        self.allow_raw_deref = self.allow_raw_deref.or(other.allow_raw_deref);
+        self.uif_ops = self.uif_ops.or(other.uif_ops);
     }
 }
 

@@ -1,11 +1,11 @@
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 use std::{
     alloc::{Allocator, Global},
     ops::{Index, IndexMut},
     slice::SliceIndex,
 };
 
-use flux_rs::extern_spec;
+use flux_attrs::extern_spec;
 
 #[extern_spec]
 #[flux::refined_by(len: int)]
@@ -47,7 +47,10 @@ impl<T> Vec<T> {
 impl<T, A: Allocator> Vec<T, A> {
     #[flux::sig(fn(self: &strg Vec<T, A>[@n], T) ensures self: Vec<T, A>[n+1])]
     fn push(v: &mut Vec<T, A>, value: T);
+}
 
+#[extern_spec]
+impl<T, A: Allocator> Vec<T, A> {
     #[flux::sig(fn(&Vec<T, A>[@n]) -> usize[n])]
     fn len(v: &Vec<T, A>) -> usize;
 }
